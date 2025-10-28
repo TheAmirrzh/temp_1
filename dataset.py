@@ -18,7 +18,7 @@ from torch.utils.data import Dataset
 from torch_geometric.data import Data
 
 import time # <-- NEW
-
+from temporal_encoder import compute_derived_mask, compute_step_numbers
 
 class StepPredictionDataset(Dataset):
     """
@@ -305,133 +305,161 @@ class StepPredictionDataset(Dataset):
         except:
             return None, None
     
+# IN: dataset.py
+# Inside StepPredictionDataset.__getitem__
+
     def __getitem__(self, idx: int) -> Data:
-        """Get a training sample."""
-        # +++ MODIFIED (Phase 2.1) +++
-        inst, step_idx, has_spectral, metadata = self.samples[idx]
-        
+        inst, step_idx, has_spectral, metadata = self.samples[idx] # Unpack correctly
         nodes = inst["nodes"]
         edges = inst["edges"]
         proof = inst["proof_steps"]
-
-        proof_length = metadata.get('proof_length', step_idx + 1)
-        if proof_length == 0: proof_length = 1
-        
-                # Create PyG Data
-        data = Data(x=x_base, edge_index=edge_index, edge_attr=edge_attr, y=y)
-
-        # Value = normalized steps remaining (1.0 at step 0, ~0.0 at end)
-        value_target = 1.0 - (step_idx / float(proof_length))
-        data.value_target = torch.tensor([value_target], dtype=torch.float)
-
-        # Part 2.1: Add Difficulty Score
-        difficulty = self._estimate_difficulty(metadata)
-        data.difficulty = torch.tensor([difficulty], dtype=torch.float)
-
-        # Create node ID mapping
         id2idx = {n["nid"]: i for i, n in enumerate(nodes)}
-        
-        # Node features (base only)
+
+        instance_id_for_spectral = inst.get("id")
+        if not instance_id_for_spectral:
+             # Fallback: Try deriving from metadata if 'id' wasn't top-level
+             instance_id_for_spectral = metadata.get("id")
+             if not instance_id_for_spectral:
+                  # Last resort: Log a warning, spectral loading will likely fail
+                  print(f"Warning: Cannot determine reliable instance ID for spectral loading in __getitem__ for sample index {idx}.")
+                  instance_id_for_spectral = f"unknown_instance_{idx}" # Placeholder
+        # --- End get instance ID ---
+
+        # --- Ensure BASE features are computed FIRST ---
         x_base = self._compute_node_features(inst, step_idx)
-        
-        # +++ MODIFIED (Phase 2.1) +++
-        # Create PyG Data with BASE features first
-        
-        # Edge index with edge types
+
+        # --- Compute edge_index, edge_attr ---
         edge_list = []
         edge_types = []
-        
         for e in edges:
-            src = id2idx[e["src"]]
-            dst = id2idx[e["dst"]]
-            edge_list.append([src, dst])
-            
-            # Edge type: 0=body, 1=head, 2=other
-            etype = 0 if e["etype"] == "body" else (1 if e["etype"] == "head" else 2)
-            edge_types.append(etype)
-        
+            src = id2idx.get(e["src"], -1) # Use .get for safety
+            dst = id2idx.get(e["dst"], -1) # Use .get for safety
+            if src != -1 and dst != -1: # Add edge only if both nodes exist
+                edge_list.append([src, dst])
+                etype = 0 if e["etype"] == "body" else (1 if e["etype"] == "head" else 2)
+                edge_types.append(etype)
+        # Handle case with no valid edges
         if edge_list:
             edge_index = torch.tensor(edge_list, dtype=torch.long).t()
             edge_attr = torch.tensor(edge_types, dtype=torch.long)
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
             edge_attr = torch.empty((0,), dtype=torch.long)
-        
-        # Target: rule used in this step
+
+        # --- Compute target y ---
         step = proof[step_idx]
         rule_nid = step["used_rule"]
-        target_idx = id2idx.get(rule_nid, -1) # Use .get for safety
-        
-        # Handle rare case where target rule isn't in nodes
-        if target_idx == -1:
-             # Create a dummy target to be skipped by loss function
-            target_idx = -1 
-
+        target_idx = id2idx.get(rule_nid, -1)
+        if target_idx == -1: target_idx = -1 # Keep dummy target if needed
         y = torch.tensor([target_idx], dtype=torch.long)
 
+        # --- CREATE the Data object HERE ---
+        pyg_data = Data(x=x_base, edge_index=edge_index, edge_attr=edge_attr, y=y)
+        # --- Use a distinct name like pyg_data ---
+
+        # --- Add other attributes ---
+        proof_length = metadata.get('proof_length', step_idx + 1)
+        if proof_length == 0: proof_length = 1
+        value_target = 1.0 - (step_idx / float(proof_length))
+        pyg_data.value_target = torch.tensor([value_target], dtype=torch.float)
+
+        difficulty = self._estimate_difficulty(metadata)
+        pyg_data.difficulty = torch.tensor([difficulty], dtype=torch.float)
+
+        tactic_idx = 0 # Default to unknown
         if target_idx != -1 and target_idx < len(nodes):
-            rule_name = nodes[target_idx].get("label", "")
-            tactic_idx = self.tactic_mapper.map_rule_to_tactic(rule_name)
+            rule_node = nodes[target_idx] # Get the correct node
+            # Ensure the target is actually a rule before getting label
+            if rule_node.get("type") == "rule":
+                 rule_name = rule_node.get("label", "")
+                 tactic_idx = self.tactic_mapper.map_rule_to_tactic(rule_name)
+        pyg_data.tactic_target = torch.tensor([tactic_idx], dtype=torch.long)
+
+        # --- Add spectral features ---
+        # eigvecs, eigvals = self._load_spectral(instance_id_for_spectral, has_spectral)
+
+
+         # --- MODIFIED: Spectral Loading ---
+        k_target = self.k_default
+
+        # Define num_nodes_check early based on base features (reliable graph size)
+        num_nodes_check = x_base.shape[0]
+
+        # Check if spectral data available
+        if has_spectral:
+            spectral_path = Path(self.spectral_dir) / f"{inst.get('id', '')}_spectral.npz"
+            try:
+                data = np.load(spectral_path)
+                eigvals_np = data["eigenvalues"].astype(np.float32)
+                eigvecs_np = data["eigenvectors"].astype(np.float32)
+
+                # Validate against eigenvectors' first dimension (num_nodes)
+                if eigvecs_np.shape[0] != num_nodes_check:
+                    raise ValueError(f"Node count mismatch: spectral={eigvecs_np.shape[0]}, graph={num_nodes_check}")
+
+                # Pad or truncate to k_target
+                current_k = len(eigvals_np)
+                if current_k < k_target:
+                    pad_k = k_target - current_k
+                    eigvals_np = np.pad(eigvals_np, (0, pad_k), mode='constant')
+                    eigvecs_np = np.pad(eigvecs_np, ((0, 0), (0, pad_k)), mode='constant')
+                elif current_k > k_target:
+                    eigvals_np = eigvals_np[:k_target]
+                    eigvecs_np = eigvecs_np[:, :k_target]
+
+                eigvals = torch.from_numpy(eigvals_np)
+                eigvecs = torch.from_numpy(eigvecs_np)
+
+            except Exception as e:
+                print(f"DEBUG [{inst.get('id')}]: {str(e)}. Using zeros.")
+                eigvals = torch.zeros((k_target,), dtype=torch.float)
+                eigvecs = torch.zeros((num_nodes_check, k_target), dtype=torch.float)  # Use num_nodes_check here
+
+            pyg_data.eigvecs = eigvecs.contiguous()
+            pyg_data.eigvals = eigvals.contiguous()
+            # --- END ADDED ---
+
         else:
-            tactic_idx = 0 # unknown
-            
-        data.tactic_target = torch.tensor([tactic_idx], dtype=torch.long)
+            # Pad with zeros if spectral data is missing or mismatched
+            pyg_data.eigvecs = torch.zeros((num_nodes_check, k_target), dtype=torch.float)  # Use num_nodes_check here
+            pyg_data.eigvals = torch.zeros((k_target,), dtype=torch.float)
 
-        
-
-        
-        # --- Spectral Feature Handling (Phase 2.1/2.2 Fix) ---
-        eigvecs, eigvals = self._load_spectral(inst.get("id", ""), has_spectral)
-
-        num_nodes = x_base.shape[0]
-
-        if eigvecs is not None and eigvecs.shape[0] == num_nodes:
-            # Check if we need to pad the spectral dimension
-            k_actual = eigvecs.shape[1]
-            if k_actual < self.k_default:
-                # Pad spectral features to match expected dimension
-                pad_k = self.k_default - k_actual
-                eigvecs = torch.cat([eigvecs, torch.zeros((num_nodes, pad_k), dtype=torch.float)], dim=1)
-                eigvals = torch.cat([eigvals, torch.zeros((pad_k,), dtype=torch.float)], dim=0)
-            elif k_actual > self.k_default:
-                # Truncate if somehow larger (shouldn't happen)
-                eigvecs = eigvecs[:, :self.k_default]
-                eigvals = eigvals[:self.k_default]
-
-            data.eigvecs = eigvecs
-            data.eigvals = eigvals
-        else:
-            # No spectral info or dimension mismatch - pad with zeros
-            data.eigvecs = torch.zeros((num_nodes, self.k_default), dtype=torch.float)
-            data.eigvals = torch.zeros((self.k_default,), dtype=torch.float)
-        # --- End Spectral Fix ---
-
-        data.meta = {
+        # --- Add meta and temporal features ---
+        pyg_data.meta = {
             "instance_id": inst.get("id", ""),
             "step_idx": step_idx,
-            "num_nodes": len(nodes),
-            "num_tactics": self.num_tactics # <-- NEW
+            "num_nodes": num_nodes_check, # Use checked num_nodes
+            "num_tactics": self.num_tactics
         }
-        
-        # --- Temporal Feature Handling (Correct) ---
-        from temporal_encoder import compute_derived_mask, compute_step_numbers
-        
-        proof_state = {
-            'num_nodes': len(nodes),
+
+        # Use num_nodes_check for consistency
+        proof_state_sim = {
+            'num_nodes': num_nodes_check,
             'derivations': [
-                (id2idx[step['derived_node']], i) 
-                for i, step in enumerate(proof[:step_idx])
-                if step['derived_node'] in id2idx # Ensure derived node exists
+                (id2idx.get(step_data['derived_node']), i) # Use .get
+                for i, step_data in enumerate(proof[:step_idx])
+                if id2idx.get(step_data.get('derived_node')) is not None # Check existence
             ]
         }
-        
-        derived_mask = compute_derived_mask(proof_state, step_idx)
-        step_numbers = compute_step_numbers(proof_state, step_idx)
-        
-        # Add to Data object
-        data.derived_mask = derived_mask
-        data.step_numbers = step_numbers
-        return data
+        derived_mask = compute_derived_mask(proof_state_sim, step_idx)
+        step_numbers = compute_step_numbers(proof_state_sim, step_idx)
+
+        # Ensure mask/steps match node count before assigning
+        if len(derived_mask) == num_nodes_check:
+             pyg_data.derived_mask = derived_mask
+        else:
+             # Handle potential mismatch, e.g., create default tensors
+             print(f"Warning: derived_mask length mismatch ({len(derived_mask)} vs {num_nodes_check})")
+             pyg_data.derived_mask = torch.zeros(num_nodes_check, dtype=torch.uint8)
+
+        if len(step_numbers) == num_nodes_check:
+             pyg_data.step_numbers = step_numbers
+        else:
+             print(f"Warning: step_numbers length mismatch ({len(step_numbers)} vs {num_nodes_check})")
+             pyg_data.step_numbers = torch.zeros(num_nodes_check, dtype=torch.long)
+
+
+        return pyg_data
 
     def _estimate_difficulty(self, metadata: dict) -> float:
         """Estimate proof difficulty (reuse from Phase 1)."""

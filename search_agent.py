@@ -152,6 +152,11 @@ class ProofSimulator:
          idx2nid = {i: nid for nid, i in id2idx.items()}
 
          known_node_indices = set(data.derived_mask.nonzero().squeeze(-1).tolist())
+         # Add indices of initial axioms
+         for i, node in enumerate(nodes):
+              # Check is_initial field from the *original* instance data
+              if node.get('type') == 'fact' and node.get('is_initial', False):
+                  known_node_indices.add(i)
 
          applicable_rule_indices = []
          for i, node in enumerate(nodes):
