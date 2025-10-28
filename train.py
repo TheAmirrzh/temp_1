@@ -64,11 +64,11 @@ class CurriculumScheduler:
             if diff <= target_difficulty
         ]
         
-        if not valid_indices: # Ensure at least base difficulty
-             valid_indices = [
-                i for i, diff in enumerate(self.difficulties)
-                if diff <= self.base_difficulty
-             ]
+        if not valid_indices:
+            # Fallback: take N easiest samples
+            sorted_indices = sorted(enumerate(self.difficulties), key=lambda x: x[1])
+            valid_indices = [i for i, _ in sorted_indices[:max(1, len(self.difficulties) // 10)]]
+            logger.warning(f"Curriculum fallback: using {len(valid_indices)} easiest samples")
         
         print(f"  [Curriculum] Epoch {epoch}: Target difficulty <= {target_difficulty:.3f}, "
               f"found {len(valid_indices)}/{len(self.difficulties)} samples.")
@@ -134,7 +134,10 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, grad_accum_s
                 # --- MODIFIED: Combined Loss ---
                 loss = (ranking_loss +
                        (value_loss_weight * val_loss))
-                batch_loss += loss
+                graph_loss = (ranking_loss + 
+                            value_loss_weight * val_loss + 
+                            tactic_loss_weight * tac_loss / batch_size)  # Divide by batch_size
+                batch_loss += graph_loss
                 batch_value_loss += val_loss.item()
                 # --- END MODIFIED ---
                 

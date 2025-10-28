@@ -166,22 +166,33 @@ class ProofFrontierAttention(nn.Module):
         # Shape: [N, N] where True = mask out (don't attend)
         attn_mask = ~is_frontier.unsqueeze(0).expand(x.shape[0], -1)
         
-        # Apply multi-head attention
-        # query=key=value=x (self-attention)
+        if x.dim() == 2:
+        # Unbatched input [N, D] -> add batch dim
+            x_batched = x.unsqueeze(0)  # [1, N, D]
+        elif x.dim() == 3:
+            # Already batched [B, N, D]
+            x_batched = x
+        else:
+            raise ValueError(f"Expected 2D or 3D input, got {x.dim()}D")
+        
+        # Apply attention
         attended, attn_weights = self.attention(
-            x.unsqueeze(0),  # Add batch dim
-            x.unsqueeze(0),
-            x.unsqueeze(0),
-            attn_mask=attn_mask, # MHA automatically adds batch dim to mask
+            x_batched,
+            x_batched,
+            x_batched,
+            attn_mask=attn_mask,
             need_weights=True
         )
         
-        attended = attended.squeeze(0)  # Remove batch dim
+        # Remove batch dim if we added it
+        if x.dim() == 2:
+            attended = attended.squeeze(0)
+            attn_weights = attn_weights.squeeze(0)
         
-        # Residual connection + layer norm
+        # Residual + LayerNorm
         output = self.layer_norm(x + attended)
         
-        return output, attn_weights.squeeze(0)
+        return output, attn_weights
 
 
 class TemporalStateEncoder(nn.Module):
@@ -371,7 +382,9 @@ class MultiScaleTemporalEncoder(nn.Module):
         # Define the windows: e.g., [2, 5, max_steps]
         # This matches the "Fine, Medium, Coarse" in the README
         if num_scales > 1:
-            self.temporal_windows = np.linspace(2, max_steps, num_scales, dtype=int)
+            self.temporal_windows = np.logspace(
+                np.log10(2), np.log10(max_steps), num_scales, dtype=int
+            )
             # Ensure the last window is always global
             self.temporal_windows[-1] = max_steps 
         else:

@@ -131,42 +131,33 @@ class TestDatasetLoading(unittest.TestCase):
         cls.test_files_for_split = []
         n_config = {Difficulty.EASY: 2, Difficulty.MEDIUM: 1}
         inst_counter = {'easy': 0, 'medium': 0}
-        cls.test_files_for_split = []
-        n_config = {Difficulty.EASY: 2, Difficulty.MEDIUM: 1}
-        inst_counter = {'easy': 0, 'medium': 0}
+
 
         for diff, count in n_config.items():
             diff_dir = TEST_DATA_DIR / diff.value
-            diff_dir.mkdir(exist_ok=True)
             for i in range(count):
                 inst_id = f"{diff.value}_{i}"
-                # Use a slightly modified DUMMY_INSTANCE structure for variety if needed
-                temp_instance = copy.deepcopy(DUMMY_INSTANCE)
-                temp_instance['id'] = inst_id
-                temp_instance['metadata']['difficulty'] = diff.value
-                file_path = diff_dir / f"{inst_id}.json"
-                with open(file_path, 'w') as f:
-                    json.dump(temp_instance, f)
-                cls.test_files_for_split.append(str(file_path))
-                print(f"  ✓ Created dummy instance: {file_path}")
-                inst_counter[diff.value] += 1
-
-        # Save DUMMY_INSTANCE_FILE path for other tests specifically needing it
-        cls.single_dummy_file = str(TEST_DATA_DIR / "medium" / "medium_0.json")
-        # --- END MODIFIED ---
-
-        # Write dummy spectral file (use the specific medium_0 file)
-        cls.dummy_spectral_path = TEST_SPECTRAL_DIR / f"{DUMMY_INSTANCE['id']}_spectral.npz"
+                # ... create JSON ...
+                
+                # CREATE SPECTRAL FILE FOR EACH INSTANCE
+                spectral_file = TEST_SPECTRAL_DIR / f"{inst_id}_spectral.npz"
+                n_nodes = 4  # From DUMMY_INSTANCE
+                k_dim = 16
+                eigvals = np.linspace(0.01, 1.5, k_dim).astype(np.float32)
+                eigvecs = np.random.rand(n_nodes, k_dim).astype(np.float32)
+                
+        cls.dummy_spectral_path = TEST_SPECTRAL_DIR / f"{DUMMY_INSTANCE['id']}_spectral.npz" # Define path
         np.savez_compressed(
-            cls.dummy_spectral_path,
-            eigenvalues=DUMMY_EIGVALS,
-            eigenvectors=DUMMY_EIGVECS,
-            num_nodes=DUMMY_INSTANCE["metadata"]["n_nodes"],
-            normalization='symmetric',
-            k=K_DIM
-        )
-        print(f"  ✓ Created dummy spectral cache: {cls.dummy_spectral_path}")
-
+                    cls.dummy_spectral_path, # Use defined path
+                    eigenvalues=DUMMY_EIGVALS,
+                    eigenvectors=DUMMY_EIGVECS,
+                    num_nodes=DUMMY_INSTANCE["metadata"]["n_nodes"],
+                    normalization='symmetric',
+                    k=K_DIM
+                )
+        # --- MOVED Print Statement ---
+        print(f"  ✓ Created dummy spectral cache: {cls.dummy_spectral_path} (k={K_DIM})")
+        # --- END MOVE ---
 
     @classmethod
     def tearDownClass(cls):
@@ -178,12 +169,13 @@ class TestDatasetLoading(unittest.TestCase):
 
     def setUp(self):
         """Load dataset instance for each test."""
-        self.dataset_no_spectral = StepPredictionDataset([self.single_dummy_file])
+        self.dataset_no_spectral = StepPredictionDataset([TestDatasetLoading.single_dummy_file])
         self.dataset_with_spectral = StepPredictionDataset(
-            [self.single_dummy_file], spectral_dir=str(TEST_SPECTRAL_DIR)
+            [TestDatasetLoading.single_dummy_file], spectral_dir=str(TEST_SPECTRAL_DIR)
         )
         self.num_nodes = DUMMY_INSTANCE["metadata"]["n_nodes"]
         self.expected_base_features = 22
+        
 
     def test_01_dataset_init(self):
         print("\nTesting dataset.StepPredictionDataset initialization...")
@@ -664,6 +656,7 @@ class TestTrainingProcess(unittest.TestCase):
              if TEST_DATA_DIR.exists(): shutil.rmtree(TEST_DATA_DIR)
              TEST_DATA_DIR.mkdir(parents=True)
              with open(DUMMY_INSTANCE_FILE, 'w') as f: json.dump(DUMMY_INSTANCE, f)
+
 
         cls.dataset_instance = StepPredictionDataset([str(DUMMY_INSTANCE_FILE)])
         # Use very small model for faster testing

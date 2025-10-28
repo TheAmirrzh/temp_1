@@ -104,6 +104,7 @@ class ProofSimulator:
         #      Recomputing all features might be easier initially but less efficient.
         print(f"      Derived fact node index: {derived_fact_idx}")
         print("      TODO: Implement recomputation of affected base features in next_data.x")
+        
 
         #    - next_data.value_target: Recalculate based on new step.
         proof_length = instance.get("metadata", {}).get('proof_length', current_step_sim + 1)

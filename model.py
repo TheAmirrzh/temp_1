@@ -56,7 +56,7 @@ class ImprovedSpectralFilter(nn.Module):
             nn.Linear(32, 64),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(64, in_dim),
+            nn.Linear(64, 1),
             nn.Tanh()  # Bound filter magnitudes [-1, 1]
         )
         
@@ -78,21 +78,10 @@ class ImprovedSpectralFilter(nn.Module):
     
     def forward(self, x: torch.Tensor, eigenvectors: torch.Tensor, 
                 eigenvalues: torch.Tensor) -> torch.Tensor:
-        """
-        Apply spectral filtering with set-to-set eigenvalue relationships.
-        
-        Args:
-            x: [N, in_dim] node features
-            eigenvectors: [N, k] eigenvector matrix
-            eigenvalues: [k] eigenvalue vector
-        
-        Returns:
-            [N, out_dim] filtered features
-        """
         N, D = x.shape
         k_actual = len(eigenvalues)
         
-        # Handle dimension mismatch
+        # Handle dimension mismatch (existing code is fine)
         if k_actual < self.k:
             pad_k = self.k - k_actual
             eigenvalues = F.pad(eigenvalues, (0, pad_k))
@@ -103,35 +92,28 @@ class ImprovedSpectralFilter(nn.Module):
             eigenvectors = eigenvectors[:, :self.k]
             k_actual = self.k
         
-        # Stage 1: Encode each eigenvalue
-        eig_features = self.eig_encoder(
-            eigenvalues.unsqueeze(-1)
-        )  # [k, 32]
+        # Stage 1: Encode eigenvalues
+        eig_features = self.eig_encoder(eigenvalues.unsqueeze(-1))  # [k, 32]
         
-        # Stage 2: Cross-eigenvalue attention (captures spectral gaps, relationships)
-        # This is what makes it "set-to-set" instead of "scalar-to-scalar"
+        # Stage 2: Cross-eigenvalue attention
         eig_context, _ = self.eig_attention(
-            eig_features.unsqueeze(0),  # Query: [1, k, 32]
-            eig_features.unsqueeze(0),  # Key
-            eig_features.unsqueeze(0)   # Value
+            eig_features.unsqueeze(0),
+            eig_features.unsqueeze(0),
+            eig_features.unsqueeze(0)
         )
         eig_context = eig_context.squeeze(0)  # [k, 32]
         
-        # Stage 3: Generate adaptive filter for each eigenvalue
-        # Each filter now depends on ALL eigenvalues (via attention)
-        filters = self.filter_generator(eig_context)  # [k, D]
+        # Stage 3: Generate filters (FIX: now outputs [k, 1])
+        filters = self.filter_generator(eig_context).squeeze(-1)  # [k]
         
         # Stage 4: Apply spectral filtering
-        # Transform to frequency domain
         x_freq = eigenvectors.t() @ x  # [k, D]
         
-        # Apply learned filters (element-wise)
-        filtered_freq = filters * x_freq  # [k, D]
+        # FIX: Broadcast filter per eigenvalue across features
+        filtered_freq = filters.unsqueeze(-1) * x_freq  # [k, D]
         
-        # Transform back to spatial domain
         x_spatial = eigenvectors @ filtered_freq  # [N, D]
         
-        # Project to output dimension
         return self.output_proj(x_spatial)  # [N, out_dim]
 
 
@@ -351,14 +333,19 @@ class FixedTemporalSpectralGNN(nn.Module):
         
         # Final scoring
         scores = self.fusion_scorer(h_combined).squeeze(-1)  # [N]
-        # Aggregate node embeddings to a graph embedding
+
         if batch is None:
              # Handle single graph case
              graph_embedding = torch.mean(h_combined, dim=0, keepdim=True)
         else:
              graph_embedding = global_mean_pool(h_combined, batch) # [batch_size, 3*hidden_dim]
-        
-        value = self.value_head(graph_embedding).squeeze(-1) # [batch_size]
+        # --- END MOVE ---
+        value = self.value_head[graph_embedding]  # [batch_size, 1]
+
+        if batch is None:
+            value = value.squeeze(-1).squeeze(0)  # Scalar
+        else:
+            value = value.squeeze(-1)  # [batch_size]
         
         return scores, h_combined, value
 
@@ -425,6 +412,7 @@ class TacticGuidedGNN(nn.Module):
         h_temporal = self.base_model.temporal_encoder(derived_mask, step_numbers, h_spectral)
         h_combined = torch.cat([h_spectral, h_spatial, h_temporal], dim=-1)
         
+        
         if batch is None:
              graph_embedding = torch.mean(h_combined, dim=0, keepdim=True)
              if x.shape[0] > 0:
@@ -434,8 +422,14 @@ class TacticGuidedGNN(nn.Module):
         else:
              graph_embedding = global_mean_pool(h_combined, batch)
              batch_indices = batch
-        
+            
         value = self.value_head(graph_embedding).squeeze(-1)
+        
+        if batch is None:
+            value = value.squeeze(-1).squeeze(0) # Scalar for single graph
+        else:
+            value = value.squeeze(-1) # [batch_size] for batched graph
+        
         # --- End Base Model Pass ---
         
         # 2. Predict Tactic
@@ -508,7 +502,7 @@ class PremiseSelector(nn.Module):
         # Score relevance of each fact to the *graph* (goal).
         
         # Simple scorer: (fact_embedding, graph_embedding) -> score
-        self.relevance_scorer = nn.Bilinear(hidden_dim * 3, hidden_dim * 3, 1)
+        # self.relevance_scorer = nn.Bilinear(hidden_dim * 3, hidden_dim * 3, 1)
         
     def score_fact_relevance(self, 
                              fact_embeddings: torch.Tensor, 

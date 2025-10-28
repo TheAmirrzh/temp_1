@@ -309,20 +309,34 @@ class StepPredictionDataset(Dataset):
 # Inside StepPredictionDataset.__getitem__
 
     def __getitem__(self, idx: int) -> Data:
-        inst, step_idx, has_spectral, metadata = self.samples[idx] # Unpack correctly
+        inst, step_idx, has_spectral, metadata = self.samples[idx]
+        
+        # FIX: Define instance_id_for_spectral FIRST
+        instance_id_for_spectral = inst.get("id")
+        if not instance_id_for_spectral:
+            instance_id_for_spectral = metadata.get("id", f"unknown_instance_{idx}") # Unpack correctly
         nodes = inst["nodes"]
         edges = inst["edges"]
         proof = inst["proof_steps"]
         id2idx = {n["nid"]: i for i, n in enumerate(nodes)}
-
+        has_spectral = False
         instance_id_for_spectral = inst.get("id")
         if not instance_id_for_spectral:
-             # Fallback: Try deriving from metadata if 'id' wasn't top-level
-             instance_id_for_spectral = metadata.get("id")
-             if not instance_id_for_spectral:
-                  # Last resort: Log a warning, spectral loading will likely fail
-                  print(f"Warning: Cannot determine reliable instance ID for spectral loading in __getitem__ for sample index {idx}.")
-                  instance_id_for_spectral = f"unknown_instance_{idx}" # Placeholder
+            instance_id_for_spectral = metadata.get("id")
+            if not instance_id_for_spectral:
+                instance_id_for_spectral = f"unknown_instance_{idx}"
+
+        if self.spectral_dir:
+            spectral_path = Path(self.spectral_dir) / f"{inst.get('id', '')}_spectral.npz"
+            has_spectral = spectral_path.exists()
+        
+        # if not instance_id_for_spectral:
+        #      # Fallback: Try deriving from metadata if 'id' wasn't top-level
+        #      instance_id_for_spectral = metadata.get("id")
+        #      if not instance_id_for_spectral:
+        #           # Last resort: Log a warning, spectral loading will likely fail
+        #           print(f"Warning: Cannot determine reliable instance ID for spectral loading in __getitem__ for sample index {idx}.")
+        #           instance_id_for_spectral = f"unknown_instance_{idx}" # Placeholder
         # --- End get instance ID ---
 
         # --- Ensure BASE features are computed FIRST ---
