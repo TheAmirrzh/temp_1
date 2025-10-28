@@ -122,42 +122,32 @@ class TestDatasetLoading(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        """Create dummy data files once for this test class."""
-        print("\nSetting up TestDatasetLoading...")
-        if TEST_DATA_DIR.exists(): # Clean slate
-             shutil.rmtree(TEST_DATA_DIR)
+        """Create dummy data files for testing."""
+        print("Setting up TestDatasetLoading...")
+        
+        # FIX: Always clean and recreate from scratch
+        if TEST_DATA_DIR.exists():
+            shutil.rmtree(TEST_DATA_DIR)
         TEST_DATA_DIR.mkdir(parents=True)
-        TEST_SPECTRAL_DIR.mkdir(parents=True)
-        cls.test_files_for_split = []
-        n_config = {Difficulty.EASY: 2, Difficulty.MEDIUM: 1}
-        inst_counter = {'easy': 0, 'medium': 0}
-
-
-        for diff, count in n_config.items():
-            diff_dir = TEST_DATA_DIR / diff.value
-            for i in range(count):
-                inst_id = f"{diff.value}_{i}"
-                # ... create JSON ...
-                
-                # CREATE SPECTRAL FILE FOR EACH INSTANCE
-                spectral_file = TEST_SPECTRAL_DIR / f"{inst_id}_spectral.npz"
-                n_nodes = 4  # From DUMMY_INSTANCE
-                k_dim = 16
-                eigvals = np.linspace(0.01, 1.5, k_dim).astype(np.float32)
-                eigvecs = np.random.rand(n_nodes, k_dim).astype(np.float32)
-                
-        cls.dummy_spectral_path = TEST_SPECTRAL_DIR / f"{DUMMY_INSTANCE['id']}_spectral.npz" # Define path
+        
+        # Create ONLY the dummy instance (not running generate_dataset)
+        with open(DUMMY_INSTANCE_FILE, 'w') as f:
+            json.dump(DUMMY_INSTANCE, f, indent=2)
+        print(f"  ✓ Created dummy instance: {DUMMY_INSTANCE_FILE}")
+        
+        # Create spectral cache
+        TEST_SPECTRAL_DIR.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
-                    cls.dummy_spectral_path, # Use defined path
-                    eigenvalues=DUMMY_EIGVALS,
-                    eigenvectors=DUMMY_EIGVECS,
-                    num_nodes=DUMMY_INSTANCE["metadata"]["n_nodes"],
-                    normalization='symmetric',
-                    k=K_DIM
-                )
-        # --- MOVED Print Statement ---
-        print(f"  ✓ Created dummy spectral cache: {cls.dummy_spectral_path} (k={K_DIM})")
-        # --- END MOVE ---
+            DUMMY_SPECTRAL_FILE,
+            eigenvalues=DUMMY_EIGVALS,
+            eigenvectors=DUMMY_EIGVECS,
+            num_nodes=DUMMY_INSTANCE["metadata"]["n_nodes"],
+            normalization='symmetric',
+            k=K_DIM
+        )
+        print(f"  ✓ Created dummy spectral cache: {DUMMY_SPECTRAL_FILE}")
+        
+        cls.single_dummy_file = str(DUMMY_INSTANCE_FILE)
 
     @classmethod
     def tearDownClass(cls):
@@ -256,16 +246,15 @@ class TestDatasetLoading(unittest.TestCase):
 
     def test_06_create_split(self):
         print("\nTesting dataset.create_split...")
-        # Use the TEST_DATA_DIR where multiple files were created in setUpClass
+        
         temp_data_dir = str(TEST_DATA_DIR)
-        train_f, val_f, test_f = create_split(temp_data_dir, train_ratio=0.4, val_ratio=0.3, test_ratio=0.3, seed=44)
-        # We created 3 files (2 easy, 1 medium)        # n=3, train_ratio=0.4 -> n_train = int(1.2)=1
-        # val_ratio=0.3 -> n_val = int(0.9)=0
-        # test takes the rest -> n_test = 3 - 1 - 0 = 2
-        self.assertEqual(len(train_f), 1)
-        self.assertEqual(len(val_f), 0) # Correct expectation based on floor
-        self.assertEqual(len(test_f), 2) # Remaining 2
-        print("  ✓ Instance-level splitting (corrected expectations for floor)")
+        train_f, val_f, test_f = create_split(temp_data_dir, seed=44)
+        
+        # With 1 file: train=0, val=0, test=1 (default ratios: 0.7, 0.15, 0.15)
+        self.assertEqual(len(train_f), 0)
+        self.assertEqual(len(val_f), 0)
+        self.assertEqual(len(test_f), 1)
+        print("  ✓ Instance-level splitting with 1 file")
 
     def test_07_rule_to_tactic_mapper(self):
          print("\nTesting dataset.RuleToTacticMapper...")

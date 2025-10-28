@@ -340,10 +340,10 @@ class FixedTemporalSpectralGNN(nn.Module):
         else:
              graph_embedding = global_mean_pool(h_combined, batch) # [batch_size, 3*hidden_dim]
         # --- END MOVE ---
-        value = self.value_head[graph_embedding]  # [batch_size, 1]
+        value = self.value_head(graph_embedding)  # [batch_size, 1]
 
         if batch is None:
-            value = value.squeeze(-1).squeeze(0)  # Scalar
+            value = value.squeeze(0)  # Scalar
         else:
             value = value.squeeze(-1)  # [batch_size]
         
@@ -423,10 +423,10 @@ class TacticGuidedGNN(nn.Module):
              graph_embedding = global_mean_pool(h_combined, batch)
              batch_indices = batch
             
-        value = self.value_head(graph_embedding).squeeze(-1)
-        
+        value = self.value_head(graph_embedding)
+
         if batch is None:
-            value = value.squeeze(-1).squeeze(0) # Scalar for single graph
+            value = value.view(1) # Scalar for single graph
         else:
             value = value.squeeze(-1) # [batch_size] for batched graph
         
@@ -448,7 +448,8 @@ class TacticGuidedGNN(nn.Module):
         
         # The original model.fusion_scorer is replaced by this
         modulated_scores = self.final_scorer(scoring_input).squeeze(-1) # [N]
-        
+        print("value_head type:", type(self.value_head))
+        print("graph_embedding shape:", graph_embedding.shape)
         return modulated_scores, h_combined, value, tactic_logits
 # --- END NEW ---
 

@@ -1,51 +1,38 @@
-# fix_critical_bugs.py - Apply all critical fixes
+import torch
+from model import FixedTemporalSpectralGNN, TacticGuidedGNN
 
-import re
+# Test single-graph value shape
+model = FixedTemporalSpectralGNN(in_dim=22, hidden_dim=64, k=16)
+model.eval()
 
-# Fix 1: dataset.py - instance_id_for_spectral
-with open('dataset.py', 'r') as f:
-    content = f.read()
+x = torch.randn(10, 22)
+edge_index = torch.randint(0, 10, (2, 20))
+derived_mask = torch.randint(0, 2, (10,)).bool()
+step_numbers = torch.randint(0, 10, (10,))
+eigvecs = torch.randn(10, 16)
+eigvals = torch.randn(16)
 
-# Find and replace the __getitem__ method's beginning
-old_pattern = r"def __getitem__\(self, idx: int\) -> Data:\s+inst, step_idx, has_spectral, metadata = self\.samples\[idx\]"
-new_code = """def __getitem__(self, idx: int) -> Data:
-        inst, step_idx, has_spectral, metadata = self.samples[idx]
-        
-        # FIX: Define instance_id_for_spectral FIRST
-        instance_id_for_spectral = inst.get("id")
-        if not instance_id_for_spectral:
-            instance_id_for_spectral = metadata.get("id", f"unknown_instance_{idx}")"""
+# Test with batch=None (single graph)
+scores, emb, value = model(x, edge_index, derived_mask, step_numbers, 
+                            eigvecs, eigvals, batch=None)
 
-content = re.sub(old_pattern, new_code, content)
+print(f"Single graph:")
+print(f"  scores shape: {scores.shape}")  # Should be [10]
+print(f"  embeddings shape: {emb.shape}")  # Should be [10, 192]
+print(f"  value shape: {value.shape}")  # Should be [1] ← THIS WAS FAILING
 
-with open('dataset.py', 'w') as f:
-    f.write(content)
+assert value.shape == torch.Size([1]), f"Expected [1], got {value.shape}"
 
-print("✓ Fixed dataset.py")
+# Test with batch (2 graphs)
+batch = torch.cat([torch.zeros(5), torch.ones(5)]).long()
+scores_b, emb_b, value_b = model(x, edge_index, derived_mask, step_numbers,
+                                   eigvecs, eigvals, batch=batch)
 
-# Fix 2: model.py - Spectral filter dimension
-with open('model.py', 'r') as f:
-    model_content = f.read()
+print(f"\nBatched (2 graphs):")
+print(f"  scores shape: {scores_b.shape}")  # Should be [10]
+print(f"  embeddings shape: {emb_b.shape}")  # Should be [10, 192]
+print(f"  value shape: {value_b.shape}")  # Should be [2]
 
-# Replace filter_generator output dimension
-model_content = model_content.replace(
-    "nn.Linear(64, in_dim),",
-    "nn.Linear(64, 1),"
-)
+assert value_b.shape == torch.Size([2]), f"Expected [2], got {value_b.shape}"
 
-# Fix the forward pass
-old_filter_apply = "filtered_freq = filters * x_freq"
-new_filter_apply = "filtered_freq = filters.squeeze(-1).unsqueeze(-1) * x_freq"
-model_content = model_content.replace(old_filter_apply, new_filter_apply)
-
-with open('model.py', 'w') as f:
-    f.write(model_content)
-
-print("✓ Fixed model.py")
-
-# Fix 3: temporal_encoder.py - Attention dimension check
-# (Manual edit required - complex regex)
-print("⚠ temporal_encoder.py requires manual edit - see above")
-
-print("\n✅ Applied critical fixes")
-print("⚠ Still need to manually fix ProofFrontierAttention.forward()")
+print("\n✅ All shape tests passed!")
