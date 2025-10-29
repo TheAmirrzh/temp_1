@@ -104,7 +104,43 @@ class ProofSimulator:
         #      Recomputing all features might be easier initially but less efficient.
         print(f"      Derived fact node index: {derived_fact_idx}")
         print("      TODO: Implement recomputation of affected base features in next_data.x")
+        # Ensure features are writable
+        if not next_data.x.is_contiguous():
+             next_data.x = next_data.x.contiguous()
+
+        # Build a set of ALL known facts *in the new state*
+        known_atoms_in_new_state = set()
+        for i, node in enumerate(nodes):
+            # Check initial facts from instance
+            if node.get('is_initial', False) and node["type"] == "fact":
+                known_atoms_in_new_state.add(node.get("atom"))
+            # Check previously derived facts from the *new* mask
+            elif next_data.derived_mask[i].item() == 1 and node["type"] == "fact":
+                 known_atoms_in_new_state.add(node.get("atom"))
+
+        # 1. Update [3]: Is derived (for derived_fact_idx)
+        next_data.x[derived_fact_idx, 3] = 1.0
+
+        # 2. Iterate all nodes to update rule-related features
+        for i, node in enumerate(nodes):
+            if node['type'] == 'rule':
+                # Update [19]: Is head of rule derived
+                head_atom = node.get("head_atom", "")
+                if head_atom in known_atoms_in_new_state:
+                    next_data.x[i, 19] = 1.0
+                else:
+                    next_data.x[i, 19] = 0.0 # Ensure it's 0 if not
+                
+                # Update [21]: Rule applicability (fraction of body satisfied)
+                body_atoms = node.get("body_atoms", [])
+                if body_atoms:
+                    body_satisfied = sum(1 for atom in body_atoms if atom in known_atoms_in_new_state)
+                    next_data.x[i, 21] = body_satisfied / len(body_atoms)
+                else:
+                    next_data.x[i, 21] = 0.0 # Rule with no body
         
+        print("      ✓ Minimal feature recomputation complete.")
+        # --- END FIX ---
 
         #    - next_data.value_target: Recalculate based on new step.
         proof_length = instance.get("metadata", {}).get('proof_length', current_step_sim + 1)
@@ -251,7 +287,7 @@ class BeamSearchRanker:
             scores_batch, _, _, _ = self.model(
                 current_batch.x, current_batch.edge_index, current_batch.derived_mask,
                 current_batch.step_numbers, current_batch.eigvecs, current_batch.eigvals,
-                current_batch.edge_attr, current_batch.batch
+                current_batch.eig_mask, current_batch.edge_attr, current_batch.batch
             )
             # --- End Batching Point ---
 

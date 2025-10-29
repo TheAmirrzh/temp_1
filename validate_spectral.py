@@ -400,19 +400,37 @@ def compare_normalization_methods(
 
 # Example usage
 if __name__ == "__main__":
+    # --- START FIX: Add argument parsing ---
+    import argparse
+    parser = argparse.ArgumentParser(description="Spectral Feature Validator")
+    parser.add_argument(
+        '--cache-dir', 
+        type=str, 
+        required=True, 
+        help='Directory containing cached spectral features'
+    )
+    parser.add_argument(
+        '--output-dir', 
+        type=str, 
+        required=True, 
+        help='Directory to save validation reports'
+    )
+    args = parser.parse_args()
+    # --- END FIX ---
+
     print("Spectral Feature Validator - Testing")
     print("=" * 60)
     
     # Example: validate a cache directory
-    cache_dir = "data/spectral"
+    cache_dir = args.cache_dir # <-- FIX: Use parsed argument
     
     if Path(cache_dir).exists():
         validator = SpectralValidator(cache_dir)
         
         # Generate full validation report
-        validator.generate_validation_report(output_dir="validation_results")
+        validator.generate_validation_report(output_dir=args.output_dir) # <-- FIX: Use parsed argument
         
-        print("\nValidation complete! Check validation_results/ for reports.")
+        print(f"\nValidation complete! Check {args.output_dir}/ for reports.")
     else:
         print(f"Cache directory not found: {cache_dir}")
         print("Run spectral feature extraction first!")

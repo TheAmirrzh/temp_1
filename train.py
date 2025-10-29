@@ -24,7 +24,7 @@ import sys
 sys.path.insert(0, '.')
 from model import get_model
 import re
-
+from losses import ApplicabilityConstrainedLoss, compute_mrr
 
 
 def get_lr(optimizer):
@@ -98,11 +98,9 @@ class CurriculumScheduler:
         return valid_indices
 
 
-def train_epoch(model, loader, optimizer, criterion, device, epoch, grad_accum_steps=1,
-                value_loss_weight=0.1, tactic_loss_weight=0.1): # <-- NEW Args    
-    """
-    FIXED: Scheduler no longer stepped here (moved to main loop).
-    """
+def train_epoch(model, loader, optimizer, criterion, device, epoch,
+                grad_accum_steps=1, value_loss_weight=0.1, tactic_loss_weight=0.1):
+    """Fixed training loop with proper mask extraction."""
     model.train()
     
     total_loss = 0
@@ -112,8 +110,8 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, grad_accum_s
     value_loss_fn = nn.MSELoss()
     total_value_loss = 0
 
-    tactic_loss_fn = nn.CrossEntropyLoss() # <-- NEW
-    total_tactic_loss = 0 # <-- NEW
+    tactic_loss_fn = nn.CrossEntropyLoss()
+    total_tactic_loss = 0
 
     optimizer.zero_grad()
     
@@ -123,80 +121,87 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, grad_accum_s
         scores, embeddings, value, tactic_logits = model(
             batch.x, batch.edge_index, batch.derived_mask,
             batch.step_numbers, batch.eigvecs, batch.eigvals,
-            batch.edge_attr, batch.batch
+            batch.eig_mask, batch.edge_attr, batch.batch
         )
 
-        
         batch_loss = 0
         batch_value_loss = 0
-        batch_tactic_loss = 0 # <-- NEW
+        batch_tactic_loss = 0
         batch_size = batch.num_graphs
         
         tactic_targets = batch.tactic_target.squeeze()
         tac_loss = tactic_loss_fn(tactic_logits, tactic_targets)
-
 
         for i in range(batch_size):
             mask = (batch.batch == i)
             graph_scores = scores[mask]
             graph_embeddings = embeddings[mask]
             target_idx = batch.y[i].item()
+            if hasattr(batch, 'applicable_mask') and batch.applicable_mask is not None:
+                graph_applicable = batch.applicable_mask[mask]
+            else:
+                print(f"WARNING: No applicable_mask in batch {i}")
+                graph_applicable = None
             
-
             
             if target_idx < 0 or target_idx >= len(graph_scores):
                 continue
             
-            ranking_loss = criterion(graph_scores, graph_embeddings, target_idx) 
+            # ✅ Pass graph-specific applicable_mask
+            ranking_loss = criterion(
+                graph_scores, 
+                graph_embeddings, 
+                target_idx,
+                applicable_mask=graph_applicable
+            )
+            
             graph_value = value[i]
             target_value = batch.value_target[i]
             val_loss = value_loss_fn(graph_value, target_value)
-            # --- END NEW ---
 
             if not (torch.isnan(ranking_loss) or torch.isinf(ranking_loss)):
-                # --- MODIFIED: Combined Loss ---
-                loss = (ranking_loss +
-                       (value_loss_weight * val_loss))
-                graph_loss = (ranking_loss + 
-                            value_loss_weight * val_loss + 
-                            tactic_loss_weight * tac_loss / batch_size)  # Divide by batch_size
+                graph_loss = (
+                    ranking_loss +
+                    value_loss_weight * val_loss +
+                    tactic_loss_weight * tac_loss / batch_size
+                )
                 batch_loss += graph_loss
                 batch_value_loss += val_loss.item()
-                # --- END MODIFIED ---
                 
                 if graph_scores.argmax().item() == target_idx:
                     correct_preds += 1
 
-        
         if batch_size > 0:
             avg_node_loss = batch_loss / batch_size
-            combined_batch_loss = avg_node_loss + (tactic_loss_weight * tac_loss)   
+            combined_batch_loss = avg_node_loss + (tactic_loss_weight * tac_loss)
             final_batch_loss = combined_batch_loss / grad_accum_steps
-            final_batch_loss.backward()
-            
-            # Gradient accumulation
+            # final_batch_loss.backward()
+
+            scaled_loss = batch_loss / grad_accum_steps
+            scaled_loss.backward()
+
             if (batch_idx + 1) % grad_accum_steps == 0:
-                # FIXED: Increased to 1.0 (from 0.5)
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
+
             
             total_loss += avg_node_loss.item()
             total_value_loss += (batch_value_loss / batch_size)
-            total_tactic_loss += tac_loss.item() # <-- NEW
+            total_tactic_loss += tac_loss.item()
             n_samples += batch_size
     
     avg_loss = total_loss / max(len(loader), 1)
     avg_value_loss = total_value_loss / max(len(loader), 1)
-    avg_tactic_loss = total_tactic_loss / max(len(loader), 1) # <-- NEW
+    avg_tactic_loss = total_tactic_loss / max(len(loader), 1)
     accuracy = correct_preds / max(n_samples, 1)
     
-    # Return all losses for logging
-    return avg_loss, avg_value_loss, avg_tactic_loss, accuracy # <-- MODIFIED
+    return avg_loss, avg_value_loss, avg_tactic_loss, accuracy
+
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device, split='val'):
-    """Enhanced evaluation with more metrics."""
+    """Fixed evaluation with proper mask extraction."""
     model.eval()
     
     losses = []
@@ -204,19 +209,17 @@ def evaluate(model, loader, criterion, device, split='val'):
     ranks = []
     value_loss_fn = nn.MSELoss()
     value_losses = []
-    tactic_loss_fn = nn.CrossEntropyLoss() # <-- NEW
-    tactic_losses = [] # <-- NEW
+    tactic_loss_fn = nn.CrossEntropyLoss()
+    tactic_losses = []
 
-    
     for batch in loader:
         batch = batch.to(device)
         
         scores, embeddings, value, tactic_logits = model(
             batch.x, batch.edge_index, batch.derived_mask,
             batch.step_numbers, batch.eigvecs, batch.eigvals,
-            batch.edge_attr, batch.batch
+            batch.eig_mask, batch.edge_attr, batch.batch
         )
-        
         batch_size = batch.num_graphs
         
         tactic_targets = batch.tactic_target.squeeze()
@@ -229,32 +232,47 @@ def evaluate(model, loader, criterion, device, split='val'):
             graph_embeddings = embeddings[mask]
             target_idx = batch.y[i].item()
             
+            # ✅ FIX: Extract applicable_mask for this specific graph
+            if hasattr(batch, 'applicable_mask'):
+                graph_applicable = batch.applicable_mask[mask]
+            else:
+                graph_applicable = None
+            
             if target_idx < 0 or target_idx >= len(graph_scores):
                 continue
             
-            loss = criterion(graph_scores, graph_embeddings, target_idx)
+            # ✅ Pass graph-specific applicable_mask
+            loss = criterion(
+                graph_scores, 
+                graph_embeddings, 
+                target_idx,
+                applicable_mask=graph_applicable
+            )
             losses.append(loss.item())
 
             val_loss = value_loss_fn(value[i], batch.value_target[i])
             value_losses.append(val_loss.item())
+
             
-            # Metrics
-            hit1.append(compute_hit_at_k(graph_scores, target_idx, 1))
-            hit3.append(compute_hit_at_k(graph_scores, target_idx, 3))
-            hit5.append(compute_hit_at_k(graph_scores, target_idx, 5))
-            hit10.append(compute_hit_at_k(graph_scores, target_idx, 10))
+            # ✅ Pass graph-specific applicable_mask to all metrics
+            hit1.append(compute_hit_at_k(graph_scores, target_idx, 1, 
+                                        applicable_mask=graph_applicable))
+            hit3.append(compute_hit_at_k(graph_scores, target_idx, 3,
+                                        applicable_mask=graph_applicable))
+            hit5.append(compute_hit_at_k(graph_scores, target_idx, 5,
+                                        applicable_mask=graph_applicable))
+            hit10.append(compute_hit_at_k(graph_scores, target_idx, 10,
+                                         applicable_mask=graph_applicable))
             
-            # MRR
-            sorted_indices = torch.argsort(graph_scores, descending=True)
-            rank = (sorted_indices == target_idx).nonzero(as_tuple=True)[0].item() + 1
-            ranks.append(1.0 / rank)
+            ranks.append(compute_mrr(graph_scores, target_idx, 
+                                    applicable_mask=graph_applicable))
     
     mrr = sum(ranks) / max(len(ranks), 1)
     
     return {
         f'{split}_loss': sum(losses) / max(len(losses), 1),
-        f'{split}_value_loss': sum(value_losses) / max(len(value_losses), 1), # <-- NEW
-        f'{split}_tactic_loss': sum(tactic_losses) / max(len(tactic_losses), 1), # <-- NEW
+        f'{split}_value_loss': sum(value_losses) / max(len(value_losses), 1),
+        f'{split}_tactic_loss': sum(tactic_losses) / max(len(tactic_losses), 1),
         f'{split}_hit1': sum(hit1) / max(len(hit1), 1),
         f'{split}_hit3': sum(hit3) / max(len(hit3), 1),
         f'{split}_hit5': sum(hit5) / max(len(hit5), 1),
@@ -262,7 +280,6 @@ def evaluate(model, loader, criterion, device, split='val'):
         f'{split}_mrr': mrr,
         f'{split}_n': len(hit1)
     }
-
 
 def main():
     import argparse
@@ -330,7 +347,8 @@ def main():
     print("\n" + "="*70)
     print("FIXED TRAINING - All Corrections Applied")
     print("="*70)
-    print(f"Loss: MarginRankingLoss (FIXED: 70% hard, 30% easy)")
+    # print(f"Loss: MarginRankingLoss (FIXED: 70% hard, 30% easy)")
+    print(f"Loss: ProofSearchRankingLoss (wrapping ApplicabilityConstrainedLoss)")
     print(f"Batch Size: {args.batch_size} (Effective: {args.batch_size * args.grad_accum_steps})")
     print(f"Gradient Accumulation: {args.grad_accum_steps} steps")
     print(f"Gradient Clipping: {args.grad_clip}")
@@ -496,3 +514,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+

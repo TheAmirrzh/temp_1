@@ -1,8 +1,10 @@
 """
 FIXED Loss Functions for Step Prediction
 
-Key Fix: ProofSearchRankingLoss now properly weights hard AND easy negatives
-Previous bug: Easy negatives had weight 0.0, so model ignored 90% of negative examples
+Key Fixes:
+1. Applicability constraint: non-applicable rules heavily penalized
+2. Separate loss for applicable vs inapplicable rules
+3. Valid negative sampling (only from applicable rules)
 """
 
 import torch
@@ -10,145 +12,151 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ProofSearchRankingLoss(nn.Module):
+class ApplicabilityConstrainedLoss(nn.Module):
     """
-    FIXED: Margin ranking loss with proper hard/easy negative weighting.
+    Loss that enforces applicability constraints.
     
-    Previous bug: With hard_negative_weight=2.0, easy negatives got weight 0.0
-    Fix: Use focal loss style with 70% hard, 30% easy
+    Key insight: In theorem proving, you can ONLY apply applicable rules.
+    This loss makes it catastrophically bad to predict non-applicable rules.
     """
-    def __init__(self, margin=1.0, hard_negative_weight=2.0):
+    
+    def __init__(self, margin=1.0, penalty_nonapplicable=100.0):
+        """
+        Args:
+            margin: Margin for margin ranking loss
+            penalty_nonapplicable: Penalty for predicting non-applicable rule
+        """
         super().__init__()
         self.margin = margin
-        # Parameter kept for backward compatibility, but not used in fixed version
-        self.hard_negative_weight = hard_negative_weight 
-        
-        # FIXED: Use focal loss style weighting
-        self.alpha_hard = 0.7
-        self.alpha_easy = 0.3
-        
-    def forward(self, scores, embeddings, target_idx):
+        self.penalty_nonapplicable = penalty_nonapplicable
+    
+    def forward(self, scores, embeddings, target_idx, applicable_mask=None):
         """
         Args:
             scores (torch.Tensor): [N] scores for each node
-            embeddings (torch.Tensor): [N, D] embeddings (for future use)
+            embeddings (torch.Tensor): [N, D] embeddings (unused for now)
             target_idx (int): Index of the correct node
+            applicable_mask (torch.Tensor): [N] binary mask of applicable rules
+                                           If None, all rules assumed applicable
+        
+        Returns:
+            loss (torch.Tensor): scalar loss
         """
         n = len(scores)
+        
+        # Handle edge cases
         if target_idx < 0 or target_idx >= n:
             return torch.tensor(0.01, device=scores.device, requires_grad=True)
-            
+        
+        # If no applicable mask provided, assume all are applicable
+        if applicable_mask is None:
+            applicable_mask = torch.ones_like(scores, dtype=torch.bool)
+        
+        # CRITICAL CONSTRAINT: Target must be applicable
+        if not applicable_mask[target_idx]:
+            # This should NEVER happen during training
+            # If it does, the data is corrupted
+            return torch.tensor(float('inf'), device=scores.device)
+        
         target_score = scores[target_idx]
         
-        # Create mask for negatives
-        mask = torch.ones_like(scores, dtype=torch.bool)
-        mask[target_idx] = False
-        negative_scores = scores[mask]
+        # Separate rules into applicable and non-applicable
+        non_applicable_mask = ~applicable_mask
+        is_target = torch.arange(n, device=scores.device) == target_idx
         
-        if len(negative_scores) == 0:
-            return torch.tensor(0.0, device=scores.device, requires_grad=True)
-
-        # Margin ranking loss: want target_score > negative_scores + margin
-        violations = F.relu(self.margin - (target_score - negative_scores))
+        # === Loss Component 1: Non-applicable rules penalty ===
+        if non_applicable_mask.any():
+            nonapplicable_scores = scores[non_applicable_mask]
+            nonapplicable_loss = torch.relu(
+                nonapplicable_scores - target_score + self.margin
+            ).mean()
+            # Scale by penalty factor
+            component1 = self.penalty_nonapplicable * nonapplicable_loss
+        else:
+            component1 = torch.tensor(0.0, device=scores.device)
         
-        # Find hard negatives (top-5 highest-scoring negatives)
-        sorted_negs, indices = torch.sort(negative_scores, descending=True)
-        hard_indices = indices[:min(5, len(indices))]
+        # === Loss Component 2: Applicable negatives ranking ===
+        applicable_negatives_mask = applicable_mask & ~is_target
         
-        easy_mask = torch.ones(len(violations), dtype=torch.bool, device=scores.device)
-        easy_mask[hard_indices] = False
+        if applicable_negatives_mask.any():
+            applicable_negative_scores = scores[applicable_negatives_mask]
+            
+            # Margin ranking: target > any negative + margin
+            ranking_violations = torch.relu(
+                self.margin - (target_score - applicable_negative_scores)
+            )
+            
+            # Focus on hard negatives (top-5 highest)
+            n_hard = min(5, len(applicable_negative_scores))
+            if n_hard > 0:
+                top_violations, _ = torch.topk(ranking_violations, k=n_hard)
+                component2 = top_violations.mean()
+            else:
+                component2 = torch.tensor(0.0, device=scores.device)
+        else:
+            # No applicable negatives - target is only applicable rule
+            # This is actually good! Reward it slightly.
+            component2 = torch.tensor(0.0, device=scores.device)
         
-        # FIXED: Focal loss style - 70% hard, 30% easy
-        hard_loss = torch.tensor(0.0, device=scores.device)
-        easy_loss = torch.tensor(0.0, device=scores.device)
-        
-        n_hard = len(hard_indices)
-        n_easy = easy_mask.sum().item()
-
-        if n_hard > 0:
-            hard_loss = violations[hard_indices].mean()
-
-        if n_easy > 0:
-            easy_loss = violations[easy_mask].mean()
-
-        # FIXED: Both hard and easy negatives contribute
-        loss = self.alpha_hard * hard_loss + self.alpha_easy * easy_loss
+        # === Total loss ===
+        loss = component1 + component2
         
         return loss
 
 
-class SimpleMultiMarginLoss(nn.Module):
+class ApplicabilityConstrainedRankingLoss(nn.Module):
     """
-    Multi-class margin loss for ranking.
-    Alternative to ProofSearchRankingLoss if you want simpler approach.
+    Simplified version: focus only on applicable rules.
     """
     
-    def __init__(self, margin: float = 1.0):
+    def __init__(self, margin=1.0):
         super().__init__()
         self.margin = margin
     
-    def forward(self, scores: torch.Tensor, target_idx: int) -> torch.Tensor:
-        n_nodes = scores.shape[0]
-        device = scores.device
+    def forward(self, scores, embeddings, target_idx, applicable_mask):
+        """
+        Args:
+            scores: [N] node scores
+            embeddings: [N, D] (unused)
+            target_idx: index of correct rule
+            applicable_mask: [N] binary mask of which rules are applicable
         
-        if target_idx >= n_nodes or target_idx < 0:
-            return torch.tensor(0.01, device=device, requires_grad=True)
+        Returns:
+            loss
+        """
+        n = len(scores)
         
-        target_score = scores[target_idx]
+        if target_idx < 0 or target_idx >= n:
+            return torch.tensor(0.01, device=scores.device, requires_grad=True)
         
-        # Compute violations for ALL other nodes
-        losses = []
-        for i in range(n_nodes):
-            if i != target_idx:
-                loss_i = F.relu(self.margin - (target_score - scores[i]))
-                losses.append(loss_i)
-        
-        if len(losses) == 0:
-            return torch.tensor(0.01, device=device, requires_grad=True)
-        
-        return torch.stack(losses).mean()
-
-
-class FocalLossForRanking(nn.Module):
-    """
-    Focal Loss adapted for ranking.
-    Down-weights easy examples, focuses on hard ones.
-    """
-    
-    def __init__(self, gamma: float = 2.0, margin: float = 1.0):
-        super().__init__()
-        self.gamma = gamma
-        self.margin = margin
-    
-    def forward(self, scores: torch.Tensor, target_idx: int) -> torch.Tensor:
-        n_nodes = scores.shape[0]
-        device = scores.device
-        
-        if target_idx >= n_nodes or target_idx < 0:
-            return torch.tensor(0.01, device=device, requires_grad=True)
+        # Target MUST be applicable
+        if not applicable_mask[target_idx]:
+            return torch.tensor(float('inf'), device=scores.device)
         
         target_score = scores[target_idx]
         
-        losses = []
-        for i in range(n_nodes):
-            if i != target_idx:
-                violation = F.relu(self.margin - (target_score - scores[i]))
-                
-                # Focal weighting
-                p = torch.exp(-violation)
-                focal_weight = (1 - p) ** self.gamma
-                
-                weighted_loss = focal_weight * violation
-                losses.append(weighted_loss)
+        # Create mask for applicable negatives
+        is_target = torch.arange(n, device=scores.device) == target_idx
+        applicable_negatives = applicable_mask & ~is_target
         
-        if len(losses) == 0:
-            return torch.tensor(0.01, device=device, requires_grad=True)
+        if not applicable_negatives.any():
+            # No competition - perfect scenario
+            return torch.tensor(0.0, device=scores.device)
         
-        return torch.stack(losses).mean()
+        negative_scores = scores[applicable_negatives]
+        
+        # Margin ranking loss
+        violations = F.relu(self.margin - (target_score - negative_scores))
+        
+        return violations.mean()
 
 
-def compute_hit_at_k(scores: torch.Tensor, target_idx: int, k: int) -> float:
-    """Compute Hit@K metric."""
+def compute_hit_at_k(scores, target_idx, k, applicable_mask=None):
+    """
+    Compute Hit@K metric.
+    
+    If applicable_mask provided, only considers applicable rules.
+    """
     if target_idx >= len(scores) or target_idx < 0:
         return 0.0
     
@@ -156,13 +164,32 @@ def compute_hit_at_k(scores: torch.Tensor, target_idx: int, k: int) -> float:
     if k == 0:
         return 0.0
     
-    top_k = torch.topk(scores, k).indices
-    return 1.0 if target_idx in top_k else 0.0
+    # Get top-k
+    top_k_indices = torch.topk(scores, k).indices
+    
+    # Check if target in top-k
+    hit = 1.0 if target_idx in top_k_indices else 0.0
+    
+    # If applicable_mask provided, check if target was actually applicable
+    if applicable_mask is not None:
+        if not applicable_mask[target_idx]:
+            # Target wasn't even applicable - mark as miss
+            hit = 0.0
+    
+    return hit
 
 
-def compute_mrr(scores: torch.Tensor, target_idx: int) -> float:
-    """Compute Mean Reciprocal Rank."""
+def compute_mrr(scores, target_idx, applicable_mask=None):
+    """
+    Compute Mean Reciprocal Rank.
+    
+    If applicable_mask provided, only considers applicable rules.
+    """
     if target_idx >= len(scores) or target_idx < 0:
+        return 0.0
+    
+    # Check applicability
+    if applicable_mask is not None and not applicable_mask[target_idx]:
         return 0.0
     
     sorted_indices = torch.argsort(scores, descending=True)
@@ -171,15 +198,38 @@ def compute_mrr(scores: torch.Tensor, target_idx: int) -> float:
     return 1.0 / rank
 
 
+def compute_applicability_ratio(scores, applicable_mask):
+    """
+    Compute what fraction of top predictions are actually applicable.
+    This is a diagnostic metric.
+    """
+    if not applicable_mask.any():
+        return 0.0
+    
+    top_k = min(5, len(scores))
+    top_indices = torch.topk(scores, k=top_k).indices
+    
+    applicable_in_top = applicable_mask[top_indices].float().mean()
+    return applicable_in_top.item()
+
+
+# Backward compatibility
+class ProofSearchRankingLoss(nn.Module):
+    """Deprecated: use ApplicabilityConstrainedLoss instead."""
+    
+    def __init__(self, margin=1.0, hard_negative_weight=2.0):
+        super().__init__()
+        self.margin = margin
+        self.hard_negative_weight = hard_negative_weight
+        self.alpha_hard = 0.7
+        self.alpha_easy = 0.3
+    
+    def forward(self, scores, embeddings, target_idx, applicable_mask=None):
+        """Calls new loss for compatibility."""
+        loss = ApplicabilityConstrainedLoss(margin=self.margin)
+        return loss(scores, embeddings, target_idx, applicable_mask)
+
+
 def get_recommended_loss():
     """Returns the FIXED loss for this task."""
-    return ProofSearchRankingLoss(margin=1.0, hard_negative_weight=2.0)
-
-
-def get_multimargin_loss():
-    """Alternative: PyTorch's built-in MultiMarginLoss."""
-    return nn.MultiMarginLoss(
-        p=1,
-        margin=1.0,
-        reduction='mean'
-    )
+    return ApplicabilityConstrainedLoss(margin=1.0, penalty_nonapplicable=100.0)
