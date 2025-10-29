@@ -135,7 +135,7 @@ class SpectralBatchProcessor:
             
             # Parse graph structure (adapt to your format)
             edges_data = graph_data.get('edges', [])
-            num_nodes = graph_data.get('num_nodes', len(graph_data.get('nodes', [])))
+            num_nodes = len(graph_data.get('nodes', []))
 
             if not edges_data: # Handles empty list
                 result['status'] = 'empty_graph'

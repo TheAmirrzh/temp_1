@@ -257,14 +257,35 @@ def generate_dataset(
 
 
 if __name__ == "__main__":
-    generate_dataset(
-        "data/horn",
-        {
-            Difficulty.EASY: 400,
-            Difficulty.MEDIUM: 400,
-            Difficulty.HARD: 300,
-            Difficulty.VERY_HARD: 300,
-            # Difficulty.EXTREME_HARD: 200
-        },
-        seed=42
-    )
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate Horn clause dataset.")
+    parser.add_argument('--output-dir', type=str, required=True, help='Directory to save the dataset')
+    parser.add_argument('--easy', type=int, default=0, help='Number of easy instances')
+    parser.add_argument('--medium', type=int, default=0, help='Number of medium instances')
+    parser.add_argument('--hard', type=int, default=0, help='Number of hard instances')
+    parser.add_argument('--very-hard', type=int, default=0, help='Number of very_hard instances')
+    parser.add_argument('--extreme-hard', type=int, default=0, help='Number of extreme_hard instances')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    
+    args = parser.parse_args()
+
+    difficulty_counts = {}
+    if args.easy > 0:
+        difficulty_counts[Difficulty.EASY] = args.easy
+    if args.medium > 0:
+        difficulty_counts[Difficulty.MEDIUM] = args.medium
+    if args.hard > 0:
+        difficulty_counts[Difficulty.HARD] = args.hard
+    if args.very_hard > 0:
+        difficulty_counts[Difficulty.VERY_HARD] = args.very_hard
+    if args.extreme_hard > 0:
+        difficulty_counts[Difficulty.EXTREME_HARD] = args.extreme_hard
+
+    if not difficulty_counts:
+        print("No instances requested. Exiting. Please specify counts like --easy 100 --medium 50")
+    else:
+        generate_dataset(
+            args.output_dir,
+            difficulty_counts,
+            seed=args.seed
+        )

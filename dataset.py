@@ -44,13 +44,13 @@ class StepPredictionDataset(Dataset):
     def __init__(self,
                  json_files: List[str],
                  spectral_dir: Optional[str] = None,
-                 seed: int = 42):
+                 seed: int = 42, k_dim: int = 16):
         self.files = json_files
         self.spectral_dir = spectral_dir
         self.samples = []
         self.tactic_mapper = RuleToTacticMapper()
         self.num_tactics = len(self.tactic_mapper.tactic_names)
-        
+        self.k_default = k_dim
         random.seed(seed)
         
         print("Loading dataset...")
@@ -93,20 +93,20 @@ class StepPredictionDataset(Dataset):
         print(f"Loaded {len(self.samples)} samples from {len(json_files)} files")
         print(f"Skipped {skipped} files")
         
-        # +++ ADDED (Phase 2.1) +++
-        # Get k from the first available sample
-        self.k_default = 16
-        for f in json_files:
-            if self.spectral_dir:
-                spectral_path = Path(self.spectral_dir) / f"{Path(f).stem}_spectral.npz"
-                if spectral_path.exists():
-                    try:
-                        data = np.load(spectral_path)
-                        self.k_default = len(data["eigenvalues"])
-                        print(f"Detected spectral dimension k={self.k_default}")
-                        break
-                    except:
-                        pass
+        # # +++ ADDED (Phase 2.1) +++
+        # # Get k from the first available sample
+        # self.k_default = 16
+        # for f in json_files:
+        #     if self.spectral_dir:
+        #         spectral_path = Path(self.spectral_dir) / f"{Path(f).stem}_spectral.npz"
+        #         if spectral_path.exists():
+        #             try:
+        #                 data = np.load(spectral_path)
+        #                 self.k_default = len(data["eigenvalues"])
+        #                 print(f"Detected spectral dimension k={self.k_default}")
+        #                 break
+        #             except:
+        #                 pass
     
     def __len__(self):
         return len(self.samples)

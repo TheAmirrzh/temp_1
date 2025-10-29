@@ -45,11 +45,34 @@ class CurriculumScheduler:
         self.max_difficulty = max_difficulty
         
         # Pre-calculate difficulties
-        print("Initializing CurriculumScheduler...")
-        self.difficulties = [
-            dataset[i].difficulty.item() for i in range(len(dataset))
-        ]
-        print("Difficulty scores cached.")
+        print("Initializing CurriculumScheduler (fast metadata scan)...")
+        
+        # --- START FIX: Avoid calling dataset[i] ---
+        # Old slow way (caused the hang):
+        # self.difficulties = [
+        #     dataset[i].difficulty.item() for i in range(len(dataset))
+        # ]
+        
+        # New fast way: Read metadata directly from the dataset's samples tuple
+        self.difficulties = []
+        if not dataset.samples:
+            print("Warning: CurriculumScheduler found no samples.")
+        
+        for sample_tuple in self.dataset.samples:
+            # sample_tuple is (inst, step_idx, has_spectral, metadata)
+            metadata = sample_tuple[3] 
+            
+            # Use the *exact same* difficulty logic as dataset.py's _estimate_difficulty
+            num_rules = metadata.get('n_rules', 10) / 100.0
+            num_facts = metadata.get('n_nodes', 20) / 200.0
+            proof_length = metadata.get('proof_length', 5) / 50.0
+            difficulty = (0.4 * num_rules + 
+                          0.3 * num_facts + 
+                          0.3 * proof_length)
+            self.difficulties.append(min(max(difficulty, 0.0), 1.0))
+        # --- END FIX ---
+        
+        print(f"Difficulty scores cached for {len(self.difficulties)} samples.")
 
     def get_batch_indices(self, epoch: int, total_epochs: int) -> list[int]:
         """Return indices for current difficulty level."""
@@ -283,6 +306,9 @@ def main():
                        help='Weight for the value prediction loss')
     parser.add_argument('--tactic-loss-weight', type=float, default=0.1,
                        help='Weight for the tactic prediction loss')
+
+    parser.add_argument('--k-dim', type=int, default=16,
+                   help='Spectral dimension (k) to use. Must match preprocessing.')
     
     args = parser.parse_args()
     
@@ -318,9 +344,9 @@ def main():
     # Load data
     train_files, val_files, test_files = create_split(args.data_dir, seed=args.seed)
     
-    train_ds = StepPredictionDataset(train_files, spectral_dir=args.spectral_dir, seed=args.seed)
-    val_ds = StepPredictionDataset(val_files, spectral_dir=args.spectral_dir, seed=args.seed+1)
-    test_ds = StepPredictionDataset(test_files, spectral_dir=args.spectral_dir, seed=args.seed+2)
+    train_ds = StepPredictionDataset(train_files, spectral_dir=args.spectral_dir, seed=args.seed, k_dim=args.k_dim)
+    val_ds = StepPredictionDataset(val_files, spectral_dir=args.spectral_dir, seed=args.seed+1, k_dim=args.k_dim)
+    test_ds = StepPredictionDataset(test_files, spectral_dir=args.spectral_dir, seed=args.seed+2, k_dim=args.k_dim)
     
     print(f"\nDataset: Train={len(train_ds)}, Val={len(val_ds)}, Test={len(test_ds)}")
     num_tactics = train_ds.num_tactics # Get from dataset
@@ -330,10 +356,11 @@ def main():
     
     
     # Model
+    # Get in_dim from the first sample, but NOT k_dim
     in_dim = train_ds[0].x.shape[1]
-    k_dim = train_ds[0].eigvecs.shape[1]
-    print(f"Input dimension: {in_dim} (Base) + {k_dim} (Spectral)")
-    
+    # Use the EXPLICIT k-dim from the command line
+    k_dim = args.k_dim 
+    print(f"Input dimension: {in_dim} (Base) + {k_dim} (Spectral) [FORCED via --k-dim]")
     model = get_model(
         in_dim, 
         args.hidden_dim, 
@@ -367,7 +394,6 @@ def main():
         mode='max',  # Maximize Hit@1
         factor=0.5,
         patience=10,
-        verbose=True,
         min_lr=1e-6
     )
     

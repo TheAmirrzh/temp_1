@@ -1,80 +1,100 @@
 #!/bin/bash
 
-# Full Pipeline Script for Horn Clause GNN Project
-# This script orchestrates data generation, spectral feature
-# preprocessing, and model training.
+# ==============================================================================
+# SOTA Horn Clause GNN - Full Research Pipeline (v5 - Final Fix)
+#
+# This script is now robust to stale caches and k-dimension mismatches.
+#
+# 1. Clears the stale spectral cache to force regeneration.
+# 2. Disables 'adaptive-k' during preprocessing to ensure a consistent k=16.
+# 3. Passes '--k-dim 16' to train.py, which now forces the model AND
+#    the dataset loaders to use this exact k-value, overriding auto-detection.
+#
+# ==============================================================================
 
 # --- Configuration ---
 
-# Directories (adjust paths as needed)
-DATA_DIR="./generated_data"        # Where raw JSON instances will be saved
-SPECTRAL_DIR="./spectral_cache"    # Where precomputed spectral features will be saved
-EXP_DIR="./experiment_results"     # Where training results (model, logs) will be saved
-VENV_PYTHON="/Users/amirmac/WorkSpace/Codes/LogNet/.venv/bin/python"   # Path to your virtual environment's Python
+# Directories
+DATA_DIR="./generated_data"
+SPECTRAL_DIR="./spectral_cache"
+EXP_DIR="./experiment_results"
+VALIDATION_DIR="./validation_reports"
 
-# Data Generation Config (Number of instances per difficulty)
-N_EASY=50
-N_MEDIUM=30
-N_HARD=10
+# Path to your virtual environment's Python
+VENV_PYTHON="/Users/amirmac/WorkSpace/Codes/LogNet/.venv/bin/python"
+
+# Data Generation Config
+N_EASY=400
+N_MEDIUM=400
+N_HARD=300
+N_VERY_HARD=300
 
 # Spectral Preprocessing Config
-SPECTRAL_K=16
-NUM_WORKERS_SPECTRAL=$(($(nproc --all 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) - 1)) # Use N-1 cores, default 4
+SPECTRAL_K=16 # This is the single source of truth for k
+NUM_WORKERS_SPECTRAL=$(($(nproc --all 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) - 1))
 
-# Training Config (Example - can be overridden by train.py defaults/args)
-EPOCHS=50
+# Training Config
+EPOCHS=10
 BATCH_SIZE=32
 HIDDEN_DIM=128
-LEARNING_RATE=0.0005
+NUM_LAYERS=4
+LEARNING_RATE=0.000۱
 VALUE_LOSS_WEIGHT=0.1
-TACTIC_LOSS_WEIGHT=0.1
+TACTIC_LOSS_WEIGHT=0.2
 
 # --- Script Logic ---
 
-# Exit immediately if a command exits with a non-zero status.
 set -e
 
-echo "🚀 Starting Full Horn Clause GNN Pipeline..."
+echo "🚀 Starting Full SOTA Horn Clause GNN Pipeline..."
 echo "================================================="
 date
 
-# 1. Create Directories
-echo "📂 [Step 1/4] Creating directories..."
+# 0. Create Directories
+echo "📂 [Step 0/6] Creating directories..."
 mkdir -p "$DATA_DIR"
 mkdir -p "$SPECTRAL_DIR"
 mkdir -p "$EXP_DIR"
-echo "   - Data directory: $DATA_DIR"
-echo "   - Spectral cache: $SPECTRAL_DIR"
-echo "   - Experiment output: $EXP_DIR"
-echo "✅ Directories created/ensured."
+mkdir -p "$VALIDATION_DIR"
+echo "✅ Directories created."
 echo "-------------------------------------------------"
 
-# 2. Data Generation
-echo "🧬 [Step 2/4] Generating dataset..."
+# 1. Data Generation
+echo "🧬 [Step 1/6] Generating dataset..."
 "$VENV_PYTHON" data_generator.py \
     --output-dir "$DATA_DIR" \
     --easy $N_EASY \
     --medium $N_MEDIUM \
     --hard $N_HARD \
-    # Add other difficulties (--very-hard, --extreme-hard) if needed
+    --very-hard $N_VERY_HARD
 echo "✅ Dataset generated in $DATA_DIR."
 echo "-------------------------------------------------"
 
+# 2. Clear Stale Cache (NEW FIX)
+echo "🔥 [Step 2/6] Clearing stale spectral cache..."
+rm -rf "$SPECTRAL_DIR"
+mkdir -p "$SPECTRAL_DIR"
+echo "✅ Stale cache cleared. Ready for regeneration."
+echo "-------------------------------------------------"
+
 # 3. Spectral Feature Preprocessing
-echo "📊 [Step 3/4] Preprocessing spectral features..."
-# --- MODIFIED: Corrected argument hyphens ---
+echo "📊 [Step 3/6] Preprocessing spectral features (parallelized)..."
+# This will now use the *correct* node count (len(nodes))
+# We REMOVE --adaptive-k to force a consistent k=16
 "$VENV_PYTHON" batch_process_spectral.py \
-    --data_dir "$DATA_DIR" \       # Corrected: two hyphens and underscore
-    --output_dir "$SPECTRAL_DIR" \   # Corrected: two hyphens and underscore
+    --data_dir "$DATA_DIR" \
+    --output_dir "$SPECTRAL_DIR" \
     --k $SPECTRAL_K \
-    --num_workers $NUM_WORKERS_SPECTRAL \
-    --adaptive-k # This flag should be okay if the script runs
-# --- END MODIFIED ---
-echo "✅ Spectral features saved in $SPECTRAL_DIR."
+    --num_workers $NUM_WORKERS_SPECTRAL
+    # --adaptive-k has been REMOVED
+echo "✅ Spectral features regenerated in $SPECTRAL_DIR with k=$SPECTRAL_K."
 echo "-------------------------------------------------"
 
 # 4. Model Training
-echo "🧠 [Step 4/4] Starting model training..."
+echo "🧠 [Step 4/6] Starting model training..."
+echo "   - Model: TacticGuidedGNN (via get_model)"
+echo "   - Dataset: StepPredictionDataset"
+echo "   - Loss: ProofSearchRankingLoss (Fixed) + Value + Tactic"
 "$VENV_PYTHON" train.py \
     --data-dir "$DATA_DIR" \
     --spectral-dir "$SPECTRAL_DIR" \
@@ -85,22 +105,32 @@ echo "🧠 [Step 4/4] Starting model training..."
     --lr $LEARNING_RATE \
     --value-loss-weight $VALUE_LOSS_WEIGHT \
     --tactic-loss-weight $TACTIC_LOSS_WEIGHT \
-    --k-dim $SPECTRAL_K # Ensure model uses same k as preprocessing
-    # Add other train.py arguments as needed (e.g., --num-layers, --dropout)
+    --k-dim $SPECTRAL_K \
+    --num-layers $NUM_LAYERS # <-- ADD THIS LINE with your desired value
 echo "✅ Training complete. Results in $EXP_DIR."
 echo "================================================="
+# 5. Post-Training Validation
+echo "🔬 [Step 5/6] Generating post-training validation reports..."
+"$VENV_PYTHON" validate_spectral.py \
+    --cache-dir "$SPECTRAL_DIR" \
+    --output-dir "$VALIDATION_DIR/spectral_report"
+"$VENV_PYTHON" validate_temporal.py \
+    --output-dir "$VALIDATION_DIR/temporal_report"
+echo "✅ Validation reports saved to $VALIDATION_DIR."
+echo "-------------------------------------------------"
 
-# (Optional) Placeholder for Inference/Search Agent
-# echo "🔍 [Optional] Running inference (Beam Search)..."
-# "$VENV_PYTHON" run_inference.py \
+# 6. Inference (Placeholder)
+echo "🔍 [Step 6/6] Inference (Beam Search)..."
+echo "   - The next step is to use the trained model for proof search."
+# "$VENV_PYTHON" run_search.py \
 #     --model-path "$EXP_DIR/best.pt" \
-#     --data-dir "$DATA_DIR/test" \ # Assuming a test split directory
+#     --data-dir "$DATA_DIR" \ 
 #     --output-file "$EXP_DIR/inference_results.json" \
 #     --beam-width 5
-# echo "✅ Inference complete."
-# echo "-------------------------------------------------"
+echo "✅ Inference placeholder complete."
+echo "-------------------------------------------------"
 
-echo "🎉 Pipeline Finished Successfully!"
+echo "🎉 Full Pipeline Finished Successfully!"
 date
 echo "================================================="
 

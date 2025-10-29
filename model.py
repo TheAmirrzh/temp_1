@@ -448,8 +448,8 @@ class TacticGuidedGNN(nn.Module):
         
         # The original model.fusion_scorer is replaced by this
         modulated_scores = self.final_scorer(scoring_input).squeeze(-1) # [N]
-        print("value_head type:", type(self.value_head))
-        print("graph_embedding shape:", graph_embedding.shape)
+        # print("value_head type:", type(self.value_head))
+        # print("graph_embedding shape:", graph_embedding.shape)
         return modulated_scores, h_combined, value, tactic_logits
 # --- END NEW ---
 
