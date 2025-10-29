@@ -34,8 +34,8 @@ SPECTRAL_K=16 # This is the single source of truth for k
 NUM_WORKERS_SPECTRAL=$(($(nproc --all 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) - 1))
 
 # Training Config
-EPOCHS=10
-BATCH_SIZE=32
+EPOCHS=20
+BATCH_SIZE=16
 HIDDEN_DIM=64
 NUM_LAYERS=3
 LEARNING_RATE=0.0005

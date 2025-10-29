@@ -14,7 +14,9 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.utils.data.dataloader import logger
 from torch_geometric.loader import DataLoader
 from torch.utils.data import SubsetRandomSampler
 
@@ -38,8 +40,8 @@ class CurriculumScheduler:
     Adapted for Phase 2 dataloader.
     """
     def __init__(self, dataset: StepPredictionDataset, 
-                 base_difficulty: float = 0.3, 
-                 max_difficulty: float = 1.0):
+                 base_difficulty: float = 0.15, 
+                 max_difficulty: float = 0.95):
         self.dataset = dataset
         self.base_difficulty = base_difficulty
         self.max_difficulty = max_difficulty
@@ -102,103 +104,150 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch,
                 grad_accum_steps=1, value_loss_weight=0.1, tactic_loss_weight=0.1):
     """Fixed training loop with proper mask extraction."""
     model.train()
-    
-    total_loss = 0
-    correct_preds = 0
-    n_samples = 0
 
-    value_loss_fn = nn.MSELoss()
+    total_rank_loss = 0
     total_value_loss = 0
-
-    tactic_loss_fn = nn.CrossEntropyLoss()
     total_tactic_loss = 0
+    correct_preds = 0
+    n_samples = 0 # Counter for number of GRAPHS processed
 
     optimizer.zero_grad()
-    
-    for batch_idx, batch in enumerate(loader):
+
+    # Use tqdm for progress bar
+    from tqdm import tqdm
+    progress_bar = tqdm(loader, desc=f"Epoch {epoch} Training", leave=False)
+
+    # for batch_idx, batch in enumerate(loader): # OLD
+    for batch_idx, batch in enumerate(progress_bar): # NEW: Use tqdm
         batch = batch.to(device)
-        
+
         scores, embeddings, value, tactic_logits = model(
             batch.x, batch.edge_index, batch.derived_mask,
             batch.step_numbers, batch.eigvecs, batch.eigvals,
             batch.eig_mask, batch.edge_attr, batch.batch
         )
 
-        batch_loss = 0
-        batch_value_loss = 0
-        batch_tactic_loss = 0
-        batch_size = batch.num_graphs
-        
-        tactic_targets = batch.tactic_target.squeeze()
-        tac_loss = tactic_loss_fn(tactic_logits, tactic_targets)
+        batch_size = batch.num_graphs # Number of graphs in this batch
 
+        # --- START FIX: Calculate Tactic Loss for the whole batch ---
+        tactic_targets = batch.tactic_target # Should have shape [batch_size] or [batch_size, 1]
+
+        # Ensure target is the correct shape (likely [batch_size])
+        if tactic_targets.dim() > 1:
+            tactic_targets = tactic_targets.squeeze()
+
+        # Handle potential empty batch edge case & shape mismatch safety
+        # Ensure tactic_logits has rows equal to batch_size
+        if batch_size > 0 and tactic_logits.shape[0] == batch_size and tactic_targets.shape[0] == batch_size:
+            # Calculate tactic loss ONCE for the whole batch
+            tac_loss = F.cross_entropy(tactic_logits, tactic_targets)
+            batch_tactic_loss_value = tac_loss.item() # For logging this batch's tactic loss
+        else:
+             # Avoid error if batch somehow becomes empty or shapes mismatch
+             tac_loss = torch.tensor(0.0, device=device, requires_grad=True)
+             batch_tactic_loss_value = 0.0
+             if batch_size > 0: # Log if there's a mismatch
+                  print(f"Warning: Shape mismatch for tactic loss. Logits: {tactic_logits.shape}, Targets: {tactic_targets.shape}, Batch Size: {batch_size}")
+        # --- END FIX ---
+
+        batch_rank_val_loss = 0 # Accumulator for ranking + value loss for graphs in this batch
+        batch_value_loss_item = 0 # Accumulator for value loss item value for logging
+        batch_rank_loss_item = 0  # Accumulator for rank loss item value for logging
+        graphs_in_batch_processed = 0 # Count graphs successfully processed in this batch
+
+        # --- Loop through graphs for Ranking and Value loss ---
         for i in range(batch_size):
             mask = (batch.batch == i)
             graph_scores = scores[mask]
+            # Handle case where a graph might have zero nodes after processing
+            if graph_scores.numel() == 0:
+                continue
+
             graph_embeddings = embeddings[mask]
             target_idx = batch.y[i].item()
-            if hasattr(batch, 'applicable_mask') and batch.applicable_mask is not None:
-                graph_applicable = batch.applicable_mask[mask]
-            else:
-                print(f"WARNING: No applicable_mask in batch {i}")
-                graph_applicable = None
-            
-            
+
+            # Get applicable mask for this graph
+            graph_applicable = batch.applicable_mask[mask] if hasattr(batch, 'applicable_mask') else None
+
+            # Skip if target is invalid or graph had no nodes
             if target_idx < 0 or target_idx >= len(graph_scores):
                 continue
-            
-            # ✅ Pass graph-specific applicable_mask
-            ranking_loss = criterion(
-                graph_scores, 
-                graph_embeddings, 
+
+            # Calculate Ranking loss for this graph
+            rank_loss = criterion(
+                graph_scores,
+                graph_embeddings,
                 target_idx,
                 applicable_mask=graph_applicable
             )
-            
-            graph_value = value[i]
-            target_value = batch.value_target[i]
-            val_loss = value_loss_fn(graph_value, target_value)
 
-            if not (torch.isnan(ranking_loss) or torch.isinf(ranking_loss)):
-                graph_loss = (
-                    ranking_loss +
-                    value_loss_weight * val_loss +
-                    tactic_loss_weight * tac_loss / batch_size
+            # Calculate Value loss for this graph
+            # Ensure value and target_value tensors have compatible shapes for MSELoss
+            graph_value = value[i].unsqueeze(0) # Make it [1]
+            target_value = batch.value_target[i].unsqueeze(0) # Make it [1]
+            val_loss = F.mse_loss(graph_value, target_value)
+
+            # Accumulate per-graph RANKING + VALUE losses
+            if not (torch.isnan(rank_loss) or torch.isinf(rank_loss)):
+                graph_rank_val_loss = (
+                    rank_loss +
+                    value_loss_weight * val_loss
+                    # Tactic loss is handled separately for the batch
                 )
-                batch_loss += graph_loss
-                batch_value_loss += val_loss.item()
-                
+                batch_rank_val_loss += graph_rank_val_loss # Accumulate Tensor loss for backprop
+                batch_value_loss_item += val_loss.item() # Accumulate value loss item for logging
+                batch_rank_loss_item += rank_loss.item() # Accumulate rank loss item for logging
+                graphs_in_batch_processed += 1 # Increment count of processed graphs
+
+                # Count correct predictions for accuracy
                 if graph_scores.argmax().item() == target_idx:
                     correct_preds += 1
 
-        if batch_size > 0:
-            avg_node_loss = batch_loss / batch_size
-            combined_batch_loss = avg_node_loss + (tactic_loss_weight * tac_loss)
+        # --- Calculate final batch loss (Avg Rank+Val + Tactic) and backpropagate ---
+        if graphs_in_batch_processed > 0:
+            # Average the Rank+Val loss over graphs successfully processed in the batch
+            avg_rank_val_loss_for_batch = batch_rank_val_loss / graphs_in_batch_processed
+            # Add the single batch-wide tactic loss
+            combined_batch_loss = avg_rank_val_loss_for_batch + (tactic_loss_weight * tac_loss)
+
+            # Scale loss for gradient accumulation
             final_batch_loss = combined_batch_loss / grad_accum_steps
-            # final_batch_loss.backward()
+            final_batch_loss.backward() # Backpropagate the combined loss
 
-            scaled_loss = batch_loss / grad_accum_steps
-            scaled_loss.backward()
+            # Accumulate total losses for epoch logging (use item values)
+            total_rank_loss += (batch_rank_loss_item / graphs_in_batch_processed) # Add avg rank loss item
+            total_value_loss += (batch_value_loss_item / graphs_in_batch_processed) # Add avg value loss item
+            total_tactic_loss += batch_tactic_loss_value # Add tactic loss item (already calculated for batch)
 
-            if (batch_idx + 1) % grad_accum_steps == 0:
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            n_samples += graphs_in_batch_processed # Accumulate number of graphs processed
+
+            # --- Gradient accumulation step ---
+            if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1 == len(loader)):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Use args.grad_clip
                 optimizer.step()
                 optimizer.zero_grad()
 
-            
-            total_loss += avg_node_loss.item()
-            total_value_loss += (batch_value_loss / batch_size)
-            total_tactic_loss += tac_loss.item()
-            n_samples += batch_size
-    
-    avg_loss = total_loss / max(len(loader), 1)
-    avg_value_loss = total_value_loss / max(len(loader), 1)
-    avg_tactic_loss = total_tactic_loss / max(len(loader), 1)
+        # Update tqdm progress bar description (optional)
+        progress_bar.set_postfix({
+             'RankL': f'{total_rank_loss / max(batch_idx + 1, 1):.4f}',
+             'ValL': f'{total_value_loss / max(batch_idx + 1, 1):.4f}',
+             'TacL': f'{total_tactic_loss / max(batch_idx + 1, 1):.4f}'
+        })
+
+    progress_bar.close() # Close tqdm bar after epoch
+
+    # --- Calculate epoch averages ---
+    num_batches_processed = batch_idx + 1
+    # Use n_samples for accuracy as it counts graphs, not batches
     accuracy = correct_preds / max(n_samples, 1)
-    
+    # Average losses over number of batches where loss was calculated
+    avg_loss = total_rank_loss / max(num_batches_processed, 1)
+    avg_value_loss = total_value_loss / max(num_batches_processed, 1)
+    avg_tactic_loss = total_tactic_loss / max(num_batches_processed, 1)
+
+
     return avg_loss, avg_value_loss, avg_tactic_loss, accuracy
-
-
+    
 @torch.no_grad()
 def evaluate(model, loader, criterion, device, split='val'):
     """Fixed evaluation with proper mask extraction."""

@@ -645,15 +645,24 @@ class StepPredictionDataset(Dataset):
         return pyg_data
 
     def _estimate_difficulty(self, metadata: dict) -> float:
-        """Estimate proof difficulty (reuse from Phase 1)."""
-        num_rules = metadata.get('n_rules', 10) / 100.0
-        num_facts = metadata.get('n_nodes', 20) / 200.0
-        proof_length = metadata.get('proof_length', 5) / 50.0
+        """
+        FIXED: Properly scaled difficulty estimation.
+        Maps instances to [0, 1] range with better discrimination.
+        """
+        n_rules = metadata.get('n_rules', 10)
+        n_nodes = metadata.get('n_nodes', 20)
+        proof_length = metadata.get('proof_length', 5)
         
-        # Combine normalized features
-        difficulty = (0.4 * num_rules + 
-                      0.3 * num_facts + 
-                      0.3 * proof_length)
+        # Normalize using ranges from generation parameters
+        rule_score = min(n_rules / 40.0, 1.0)
+        node_score = min(n_nodes / 70.0, 1.0)
+        proof_score = min(proof_length / 15.0, 1.0)
+        
+        # Weighted (heavier on proof length - most indicative)
+        difficulty = (0.3 * rule_score + 
+                      0.2 * node_score + 
+                      0.5 * proof_score)
+        
         return min(max(difficulty, 0.0), 1.0)
 
 

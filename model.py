@@ -22,10 +22,7 @@ from typing import List, Dict, Optional, Tuple
 
 class ImprovedSpectralFilter(nn.Module):
     """
-    FIXED: Set-to-set spectral filtering.
-    
-    Key improvement: Each eigenvalue's filter depends on ALL other eigenvalues,
-    capturing spectral gaps and relative positions.
+    FIXED: Efficient batched spectral filtering with variable k support
     """
     
     def __init__(self, in_dim: int, out_dim: int, k: int):
@@ -34,32 +31,29 @@ class ImprovedSpectralFilter(nn.Module):
         self.out_dim = out_dim
         self.k = k
         
-        # Stage 1: Encode each eigenvalue independently
+        # Simplified architecture for small graphs
+        # Stage 1: Eigenvalue encoding
         self.eig_encoder = nn.Sequential(
-            nn.Linear(1, 32),
-            nn.LayerNorm(32),
+            nn.Linear(1, 16),
+            nn.LayerNorm(16),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(32, 32),
-            nn.LayerNorm(32)
+            nn.Linear(16, 16)
         )
         
-        # Stage 2: Cross-eigenvalue context (set-to-set)
-        # This is the KEY difference from your original implementation
+        # Stage 2: Attention over eigenvalues (batched)
         self.eig_attention = nn.MultiheadAttention(
-            embed_dim=32,
-            num_heads=4,
+            embed_dim=16,
+            num_heads=2,  # Reduced for stability
             dropout=0.1,
             batch_first=True
         )
         
-        # Stage 3: Generate filter coefficients using full eigenvalue context
+        # Stage 3: Filter generator
         self.filter_generator = nn.Sequential(
-            nn.Linear(32, 64),
+            nn.Linear(16, 32),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, 1),
-            nn.Tanh()  # Bound filter magnitudes [-1, 1]
+            nn.Linear(32, 1),
+            nn.Tanh()
         )
         
         # Stage 4: Output projection
@@ -71,7 +65,6 @@ class ImprovedSpectralFilter(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        """Xavier initialization for stable training."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
@@ -80,99 +73,90 @@ class ImprovedSpectralFilter(nn.Module):
     
     def forward(self, x: torch.Tensor, eigenvectors: torch.Tensor,
                 eigenvalues: torch.Tensor, eig_mask: torch.Tensor,
-                batch: Optional[torch.Tensor] = None) -> torch.Tensor: # <-- ADD batch
+                batch: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        FIXED: Properly batched forward pass
+        
+        Args:
+            x: [N, D] node features
+            eigenvectors: [N, k] eigenvectors (variable k per graph via mask)
+            eigenvalues: [B*k_max] concatenated eigenvalues
+            eig_mask: [B*k_max] mask for valid eigenvalues
+            batch: [N] batch assignment
+        
+        Returns:
+            [N, out_dim] filtered features
+        """
         N, D = x.shape
-        k_target = self.k
-
-        # Determine batch size
-        if batch is None: # Handle single graph case
+        
+        if batch is None:
             batch = torch.zeros(N, dtype=torch.long, device=x.device)
             bsz = 1
         else:
-            bsz = batch.max().item() + 1 # Number of graphs in batch
-
-        # --- Process Eigenvalues Graph-by-Graph for Attention & Filters ---
-        filters_list = []
-        for i in range(bsz):
-            # Extract eigenvalues and mask for the current graph
-            # Assuming eigenvalues/mask are concatenated [B*k]
-            start_idx = i * k_target
-            end_idx = (i + 1) * k_target
-            
-            eigvals_graph = eigenvalues[start_idx:end_idx]
-            eig_mask_graph = eig_mask[start_idx:end_idx]
-            
-            # --- Handle potential padding/truncation within the BATCH slice ---
-            # (Dataset loader should already handle this, but add safety)
-            current_k_in_slice = len(eigvals_graph)
-            if current_k_in_slice < k_target:
-                 pad_k = k_target - current_k_in_slice
-                 eigvals_graph = F.pad(eigvals_graph, (0, pad_k))
-                 eig_mask_graph = F.pad(eig_mask_graph, (0, pad_k), value=False)
-            elif current_k_in_slice > k_target:
-                 eigvals_graph = eigvals_graph[:k_target]
-                 eig_mask_graph = eig_mask_graph[:k_target]
-            # --- End safety check ---
-
-            if k_target == 0: # Handle k=0 case
-                 filters_list.append(torch.empty(0, device=x.device))
-                 continue
-
-            # Stage 1: Encode eigenvalues (for this graph)
-            eig_features = self.eig_encoder(eigvals_graph.unsqueeze(-1))  # [k, 32]
-
-            # Stage 2: Cross-eigenvalue attention (for this graph)
-            padding_mask = ~eig_mask_graph.bool() # [k]
-
-            # Attention expects (SeqLen, Batch, Emb) or (Batch, SeqLen, Emb) if batch_first=True
-            # Here, Batch=1 for the single graph processing
-            eig_context, _ = self.eig_attention(
-                eig_features.unsqueeze(0), # Query [1, k, 32]
-                eig_features.unsqueeze(0), # Key   [1, k, 32]
-                eig_features.unsqueeze(0), # Value [1, k, 32]
-                key_padding_mask=padding_mask.unsqueeze(0) # [1, k]
-            ) # Output eig_context shape [1, k, 32]
-            eig_context = eig_context.squeeze(0) # [k, 32]
-
-            # Stage 3: Generate filters (for this graph)
-            filters_graph = self.filter_generator(eig_context).squeeze(-1)  # [k]
-
-            # Zero-out filters for padded dimensions
-            filters_graph = filters_graph.masked_fill(padding_mask, 0.0) # [k]
-            filters_list.append(filters_graph)
-            
-        # filters tensor now shape [B, k] after stacking
-        filters = torch.stack(filters_list, dim=0)
-
-        # Stage 4: Apply spectral filtering (Graph by Graph using batch index)
+            bsz = batch.max().item() + 1
+        
+        # Handle variable k by using mask
+        # Assume eigenvalues/mask are [B, k_max] after reshaping
+        k_max = len(eigenvalues) // bsz
+        eigvals_batched = eigenvalues.view(bsz, k_max)
+        mask_batched = eig_mask.view(bsz, k_max)
+        
+        # === Stage 1 & 2: Generate filters (batched) ===
+        # Encode all eigenvalues at once
+        eig_features = self.eig_encoder(eigvals_batched.unsqueeze(-1))  # [B, k_max, 16]
+        
+        # Apply attention with masking
+        padding_mask = ~mask_batched  # [B, k_max]
+        eig_context, _ = self.eig_attention(
+            eig_features,  # Query
+            eig_features,  # Key
+            eig_features,  # Value
+            key_padding_mask=padding_mask
+        )  # [B, k_max, 16]
+        
+        # Generate filters
+        filters = self.filter_generator(eig_context).squeeze(-1)  # [B, k_max]
+        filters = filters.masked_fill(padding_mask, 0.0)
+        
+        # === Stage 3: Apply spectral filtering (per graph) ===
+        # This must be done per graph due to variable k
         output_list = []
+        
         for i in range(bsz):
-            graph_node_mask = (batch == i)
-            x_graph = x[graph_node_mask] # [N_i, D]
-            eigvecs_graph = eigenvectors[graph_node_mask] # [N_i, k] - Assumes eigenvectors follow node batching
-            filters_graph = filters[i] # [k]
-
-            if x_graph.numel() == 0 or eigvecs_graph.numel() == 0 or k_target == 0:
-                # Handle empty graph or k=0 case - project directly
-                output_list.append(self.output_proj(x_graph)) # Apply projection even if empty
-                continue
-                
-            x_freq_graph = eigvecs_graph.t() @ x_graph # [k, N_i] @ [N_i, D] -> [k, D]
+            graph_mask = (batch == i)
+            x_graph = x[graph_mask]  # [N_i, D]
+            eigvecs_graph = eigenvectors[graph_mask]  # [N_i, k_i]
+            filters_graph = filters[i]  # [k_max]
+            valid_mask = mask_batched[i]  # [k_max]
             
-            # Apply filters
-            filtered_freq_graph = filters_graph.unsqueeze(-1) * x_freq_graph # [k, D] (Broadcasting)
+            # Get actual k for this graph
+            k_actual = valid_mask.sum().item()
+            
+            if k_actual == 0 or x_graph.numel() == 0:
+                # No spectral info - just project
+                output_list.append(self.output_proj(x_graph))
+                continue
+            
+            # Use only valid eigenvectors/filters
+            eigvecs_valid = eigvecs_graph[:, :k_actual]  # [N_i, k_actual]
+            filters_valid = filters_graph[:k_actual]  # [k_actual]
+            
+            # Transform to frequency domain
+            x_freq = eigvecs_valid.t() @ x_graph  # [k_actual, D]
+            
+            # Apply filters (element-wise multiply)
+            filtered_freq = filters_valid.unsqueeze(-1) * x_freq  # [k_actual, D]
             
             # Transform back to spatial domain
-            x_spatial_graph = eigvecs_graph @ filtered_freq_graph # [N_i, k] @ [k, D] -> [N_i, D]
+            x_spatial = eigvecs_valid @ filtered_freq  # [N_i, D]
             
-            # Project and add to list
-            output_list.append(self.output_proj(x_spatial_graph)) # [N_i, out_dim]
-
-        # Concatenate results for the whole batch
-        x_spectral_out = torch.cat(output_list, dim=0) # [TotalNodes, out_dim]
-
-        return x_spectral_out
-
+            # Project to output dimension
+            output_list.append(self.output_proj(x_spatial))
+        
+        # Concatenate all graphs
+        x_out = torch.cat(output_list, dim=0)  # [N, out_dim]
+        
+        return x_out
 
 class TypeAwareGATv2Conv(nn.Module):
     """

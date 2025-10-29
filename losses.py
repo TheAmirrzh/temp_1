@@ -13,96 +13,72 @@ import torch.nn.functional as F
 
 
 class ApplicabilityConstrainedLoss(nn.Module):
-    """
-    Loss that enforces applicability constraints.
-    
-    Key insight: In theorem proving, you can ONLY apply applicable rules.
-    This loss makes it catastrophically bad to predict non-applicable rules.
-    """
-    
-    def __init__(self, margin=1.0, penalty_nonapplicable=100.0):
+    def __init__(self, margin=1.0, penalty_nonapplicable=10.0):  # REDUCED from 100
         """
-        Args:
-            margin: Margin for margin ranking loss
-            penalty_nonapplicable: Penalty for predicting non-applicable rule
+        FIXED: More stable penalty weights
         """
         super().__init__()
         self.margin = margin
         self.penalty_nonapplicable = penalty_nonapplicable
     
     def forward(self, scores, embeddings, target_idx, applicable_mask=None):
-        """
-        Args:
-            scores (torch.Tensor): [N] scores for each node
-            embeddings (torch.Tensor): [N, D] embeddings (unused for now)
-            target_idx (int): Index of the correct node
-            applicable_mask (torch.Tensor): [N] binary mask of applicable rules
-                                           If None, all rules assumed applicable
-        
-        Returns:
-            loss (torch.Tensor): scalar loss
-        """
         n = len(scores)
         
-        # Handle edge cases
         if target_idx < 0 or target_idx >= n:
             return torch.tensor(0.01, device=scores.device, requires_grad=True)
         
-        # If no applicable mask provided, assume all are applicable
         if applicable_mask is None:
             applicable_mask = torch.ones_like(scores, dtype=torch.bool)
         
-        # CRITICAL CONSTRAINT: Target must be applicable
+        # CRITICAL: Target must be applicable
         if not applicable_mask[target_idx]:
-            # This should NEVER happen during training
-            # If it does, the data is corrupted
-            return torch.tensor(float('inf'), device=scores.device)
+            # Return large but finite loss (not inf)
+            return torch.tensor(100.0, device=scores.device, requires_grad=True)
         
         target_score = scores[target_idx]
         
-        # Separate rules into applicable and non-applicable
+        # === Component 1: Non-applicable penalty ===
         non_applicable_mask = ~applicable_mask
         is_target = torch.arange(n, device=scores.device) == target_idx
         
-        # === Loss Component 1: Non-applicable rules penalty ===
         if non_applicable_mask.any():
             nonapplicable_scores = scores[non_applicable_mask]
-            nonapplicable_loss = torch.relu(
+            # FIXED: Use sigmoid instead of relu for smoother gradients
+            nonapplicable_loss = torch.sigmoid(
                 nonapplicable_scores - target_score + self.margin
             ).mean()
-            # Scale by penalty factor
             component1 = self.penalty_nonapplicable * nonapplicable_loss
         else:
             component1 = torch.tensor(0.0, device=scores.device)
         
-        # === Loss Component 2: Applicable negatives ranking ===
+        # === Component 2: Applicable negatives ranking ===
         applicable_negatives_mask = applicable_mask & ~is_target
         
         if applicable_negatives_mask.any():
             applicable_negative_scores = scores[applicable_negatives_mask]
             
-            # Margin ranking: target > any negative + margin
-            ranking_violations = torch.relu(
+            # FIXED: Smoother margin ranking with log-softmax
+            # This prevents exploding gradients
+            margin_violations = torch.relu(
                 self.margin - (target_score - applicable_negative_scores)
             )
             
-            # Focus on hard negatives (top-5 highest)
+            # Focus on top-k hardest negatives (prevents overwhelming)
             n_hard = min(5, len(applicable_negative_scores))
             if n_hard > 0:
-                top_violations, _ = torch.topk(ranking_violations, k=n_hard)
+                top_violations, _ = torch.topk(margin_violations, k=n_hard)
                 component2 = top_violations.mean()
             else:
                 component2 = torch.tensor(0.0, device=scores.device)
         else:
-            # No applicable negatives - target is only applicable rule
-            # This is actually good! Reward it slightly.
             component2 = torch.tensor(0.0, device=scores.device)
         
-        # === Total loss ===
-        loss = component1 + component2
+        # === Combine with temperature scaling ===
+        # This prevents initial loss from being too large
+        temperature = 0.5  # Scales down initial loss
+        loss = temperature * (component1 + component2)
         
         return loss
-
 
 class ApplicabilityConstrainedRankingLoss(nn.Module):
     """

@@ -388,7 +388,7 @@ def main():
     parser.add_argument(
         '--adaptive-k',
         action='store_true',
-        default=False,
+        default=True,
         help='Use adaptive k based on graph size (default: True)'
     )
     parser.add_argument(
