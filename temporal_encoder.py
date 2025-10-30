@@ -128,6 +128,8 @@ class ProofFrontierAttention(nn.Module):
             batch_first=True
         )
         self.layer_norm = nn.LayerNorm(hidden_dim)
+
+        self.gate_proj = nn.Linear(hidden_dim * 2, hidden_dim)
         
         logger.info(f"ProofFrontierAttention initialized: "
                     f"heads={num_heads}, window={frontier_window}")
@@ -165,7 +167,7 @@ class ProofFrontierAttention(nn.Module):
         # Create attention mask: only attend to frontier nodes
         # Shape: [N, N] where True = mask out (don't attend)
         attn_mask = ~is_frontier.unsqueeze(0).expand(x.shape[0], -1)
-        
+
         if x.dim() == 2:
         # Unbatched input [N, D] -> add batch dim
             x_batched = x.unsqueeze(0)  # [1, N, D]
@@ -191,7 +193,16 @@ class ProofFrontierAttention(nn.Module):
         
         # Residual + LayerNorm
         output = self.layer_norm(x + attended)
-        
+
+        gate_input = torch.cat([x, attended], dim=-1)
+        gate = torch.sigmoid(self.gate_proj(gate_input))
+
+        # Apply gated residual
+        output = gate * attended + (1 - gate) * x
+
+        # Apply final layer normalization
+        output = self.layer_norm(output)
+
         return output, attn_weights
 
 

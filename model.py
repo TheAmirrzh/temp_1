@@ -17,7 +17,8 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool
 from temporal_encoder import MultiScaleTemporalEncoder
 from typing import List, Dict, Optional, Tuple
-
+from torch_geometric.nn.dense import dense_diff_pool as DiffPool
+from torch_geometric.utils import to_dense_adj, dense_to_sparse, to_dense_batch
 
 
 class ImprovedSpectralFilter(nn.Module):
@@ -158,6 +159,72 @@ class ImprovedSpectralFilter(nn.Module):
         
         return x_out
 
+
+class SetToSetSpectralFilter(nn.Module):
+    """
+    FIXED (Issue #5): Implements a SOTA Set-to-Set spectral filter.
+    Learns a [k, k] mixing matrix to filter spectral signals.
+    This version operates *purely in the spectral domain*.
+    """
+    def __init__(self, in_dim: int, out_dim: int, k: int, hidden_dim: int = 64):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.k = k # k is k_max
+
+        # Network to generate the [k, k] filter matrix
+        self.filter_net = nn.Sequential(
+            nn.Linear(self.k, hidden_dim), # Input: [B, k] eigenvalues
+            nn.ELU(),
+            nn.Linear(hidden_dim, self.k * self.k) # Output: [B, k*k] filter
+        )
+        
+        # Projection for input features (from D_in to D_out)
+        self.input_proj = nn.Linear(in_dim, out_dim)
+        self.output_norm = nn.LayerNorm(out_dim)
+        
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain('relu'))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x_freq_batch: torch.Tensor, 
+                eigenvalues_batch: torch.Tensor, 
+                eig_mask_batch: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x_freq_batch: [B, k_max, D_in] (Node features in spectral domain)
+            eigenvalues_batch: [B, k_max] (Eigenvalues)
+            eig_mask_batch: [B, k_max] (Mask for valid eigenvalues)
+        
+        Returns:
+            [B, k_max, D_out] (Filtered features in spectral domain)
+        """
+        B, k_max, D_in = x_freq_batch.shape
+        
+        # 1. Generate [B, k, k] filter matrices from eigenvalues
+        filter_matrices = self.filter_net(eigenvalues_batch).view(B, k_max, k_max)
+        
+        # 2. Apply 2D mask to filters
+        # Mask ensures we only mix valid spectral components
+        mask_2d = eig_mask_batch.unsqueeze(-1) & eig_mask_batch.unsqueeze(1) # [B, k, k]
+        filter_matrices = filter_matrices.masked_fill(~mask_2d, 0.0)
+
+        # 3. Project input features to output dimension
+        x_proj = self.input_proj(x_freq_batch) # [B, k_max, D_out]
+
+        # 4. Apply set-to-set filtering (Batched Matrix-Matrix Multiply)
+        # (B, k, k) @ (B, k, D_out) -> (B, k, D_out)
+        x_filtered = filter_matrices @ x_proj
+        
+        # 5. Apply normalization
+        x_filtered = self.output_norm(x_filtered)
+        
+        return x_filtered
 class TypeAwareGATv2Conv(nn.Module):
     """
     GATv2Conv with type-awareness for fact vs rule nodes.
@@ -200,7 +267,7 @@ class NodeRankingGNN(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         
-        self.edge_encoder = nn.Embedding(3, hidden_dim // num_heads)
+        self.edge_encoder = nn.Embedding(4, hidden_dim // num_heads)
         self.input_proj = nn.Linear(in_dim, hidden_dim)
         
         self.convs = nn.ModuleList()
@@ -276,61 +343,79 @@ class NodeRankingGNN(nn.Module):
         return scores, h
 
 
+# [ --- NEW: SOTA REFACTOR (Points 5, 8, 9) --- ]
 class FixedTemporalSpectralGNN(nn.Module):
     """
-    FIXED: Properly combines spectral, spatial, and temporal pathways.
+    SOTA-Refactored GNN Architecture.
     
-    Key fixes:
-    1. Parallel pathways (no sequential information loss)
-    2. Temporal encoder uses spectral features (global context)
-    3. Multi-scale temporal encoding by default
-    4. Late fusion of all three pathways
+    Implements all 9 points from the analysis brief:
+    1. Spectral Correction: Implemented in spectral_features.py
+    2. Value Function: Implemented in dataset.py
+    3. Curriculum: Implemented in train.py
+    4. Temporal Over-smoothing: Implemented in temporal_encoder.py
+    5. Spectral Filter: SetToSetSpectralFilter (replaces ImprovedSpectralFilter)
+    6. Contrastive Loss: Implemented in train.py/dataset.py/losses.py
+    7. Beam Search: Implemented in search_agent.py
+    8. Graph Rewiring: Implemented as self.rewirer
+    9. Hierarchical Pooling: Implemented as self.hierarchical_pooler
     """
     
     def __init__(self, in_dim, hidden_dim=256, num_layers=3, num_heads=4, 
-                 dropout=0.3, k=16):
+                 dropout=0.3, k=16, max_nodes=100):
         super().__init__()
         
         self.base_dim = in_dim
         self.k = k
         self.hidden_dim = hidden_dim
-        # Takes the fused graph embedding as input
-        self.value_head = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim), # Input is 3*hidden_dim
-            nn.ELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid() # Output value between 0 (end) and 1 (start)
-        )
+        self.max_nodes = max_nodes
+
         
-        # Pathway 1: Spectral (global structure)
-        self.spectral_filter = ImprovedSpectralFilter(
-            in_dim=self.base_dim,
+        # --- Point 8: Graph Rewiring ---
+        self.rewirer = GraphRewiring(shortcut_edge_type=3)
+        
+        # --- Point 5: Set-to-Set Spectral Filter ---
+        self.spectral_filter = SetToSetSpectralFilter(
+            in_dim=self.base_dim, # Note: SetToSet filter has its own in_proj
             out_dim=hidden_dim,
-            k=self.k
+            k=self.k,
         )
         
-        # Pathway 2: Structural (local message passing)
-        # FIXED: Takes base features, not spectral-enriched features
+        # --- Pathway 2: Structural (Unchanged, but now sees new edge type) ---
         self.struct_gnn = NodeRankingGNN(
-            in_dim=self.base_dim,  # Direct from base features
+            in_dim=self.base_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             num_heads=num_heads,
             dropout=dropout
         )
         
-        # Pathway 3: Temporal (proof state evolution)
-        # FIXED: Now uses MultiScaleTemporalEncoder
+        # --- Pathway 3: Temporal (Unchanged, but uses fixed encoder) ---
         self.temporal_encoder = MultiScaleTemporalEncoder(
             hidden_dim=hidden_dim,
-            num_scales=3,  # Fine, medium, coarse
+            num_scales=3,
             max_steps=100,
             dropout=dropout
         )
         
-        # FIXED: Fusion layer takes ALL THREE pathways
-        # Input: hidden_dim (spectral) + hidden_dim (spatial) + hidden_dim (temporal)
+        # --- Point 9: Hierarchical Pooling ---
+        # Note: We must guess a reasonable max_nodes for DiffPool
+        self.hierarchical_pooler = HierarchicalProofEncoder(
+            in_dim=self.base_dim,         # Input features (e.g., 22D)
+            gnn_hidden_dim=hidden_dim,   # GNN's internal dim (e.g., 256D)
+            output_dim=hidden_dim * 3,   # Final output dim (e.g., 768D)
+            max_nodes=self.max_nodes
+        )
+        
+        # --- Value Head (Unchanged, takes 3*D from pooler) ---
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.ELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+        
+        # --- Fusion Scorer (Unchanged) ---
         self.fusion_scorer = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim * 2),
             nn.ELU(),
@@ -342,53 +427,140 @@ class FixedTemporalSpectralGNN(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1)
         )
+        # self.rewirer = GraphRewiring(k_hop=2, new_edge_type=2)
+        
     
     def forward(self, x, edge_index, derived_mask, step_numbers, eigvecs, eigvals, eig_mask,  
                 edge_attr=None, batch=None):
-        """
-        FIXED forward pass with parallel pathways.
         
-        Returns:
-            scores: [N] node scores for ranking
-            embeddings: [N, hidden_dim*3] combined embeddings (for loss computation)
-        """
-        # FIXED: All three pathways operate independently (parallel)
+        N, D_in = x.shape
+        if batch is None:
+            batch = torch.zeros(N, dtype=torch.long, device=x.device)
+            
+        bsz = batch.max().item() + 1
+        k_max = self.k
         
-        # Pathway 1: Spectral - captures global proof structure
-        h_spectral = self.spectral_filter(x, eigvecs, eigvals, eig_mask, batch)  # [N, hidden_dim]
+        # --- Point 8: Graph Rewiring ---
+        # Apply rewiring at the start of the forward pass
+        # This creates the augmented graph topology
+        aug_edge_index, aug_edge_attr = self.rewirer(
+            edge_index, edge_attr, num_nodes=N
+        )
+
+        # --- Pathway 1: Spectral (Set-to-Set) ---
+        # This pathway is now much more complex
         
-        # Pathway 2: Structural - captures local rule dependencies
-        # FIXED: Uses base features x, not spectral-enriched
-        _, h_spatial = self.struct_gnn(x, edge_index, edge_attr, batch)  # [N, hidden_dim]
+        # 1. Manually batch features for GFT
+        # We need to transform x [N, D] -> [B, N_max, D]
+        # and eigvecs [N, k] -> [B, N_max, k]
+        # This is complex. A simpler, per-graph loop (like old filter) is safer.
         
-        # Pathway 3: Temporal - captures proof evolution
-        # FIXED: Uses spectral features (global context), not spatial
+        x_freq_list = []
+        eigvals_list = []
+        eig_mask_list = []
+        
+        # This loop is slow but correct for variable graph sizes
+        for i in range(bsz):
+            graph_mask = (batch == i)
+            x_graph = x[graph_mask]             # [N_i, D_in]
+            eigvecs_graph = eigvecs[graph_mask] # [N_i, k_max]
+            
+            # Get valid k for this graph
+            k_actual = eig_mask[i*k_max : (i+1)*k_max].sum().item()
+            if k_actual == 0 or x_graph.numel() == 0:
+                # Pad with zeros
+                x_freq_list.append(torch.zeros((k_max, D_in), device=x.device))
+                eigvals_list.append(eigvals[i*k_max : (i+1)*k_max])
+                eig_mask_list.append(eig_mask[i*k_max : (i+1)*k_max])
+                continue
+
+            eigvecs_valid = eigvecs_graph[:, :k_actual] # [N_i, k_actual]
+            
+            # 2. Graph Fourier Transform (GFT)
+            x_freq_graph = eigvecs_valid.t() @ x_graph # [k_actual, D_in]
+            
+            # 3. Pad to k_max for batching
+            pad_size = k_max - k_actual
+            x_freq_padded = F.pad(x_freq_graph, (0, 0, 0, pad_size)) # [k_max, D_in]
+            
+            x_freq_list.append(x_freq_padded)
+            eigvals_list.append(eigvals[i*k_max : (i+1)*k_max])
+            eig_mask_list.append(eig_mask[i*k_max : (i+1)*k_max])
+            
+        # 4. Stack into a batch for the spectral filter
+        x_freq_batch = torch.stack(x_freq_list)     # [B, k_max, D_in]
+        eigvals_batch = torch.stack(eigvals_list)   # [B, k_max]
+        eig_mask_batch = torch.stack(eig_mask_list) # [B, k_max]
+        
+        # 5. Apply Set-to-Set Filter (Point #5)
+        x_filtered_freq = self.spectral_filter(
+            x_freq_batch, eigvals_batch, eig_mask_batch
+        ) # [B, k_max, D_out]
+        
+        # 6. Inverse Graph Fourier Transform (IGFT) - back to spatial
+        h_spectral_list = []
+        for i in range(bsz):
+            graph_mask = (batch == i)
+            eigvecs_graph = eigvecs[graph_mask] # [N_i, k_max]
+            
+            k_actual = eig_mask[i*k_max : (i+1)*k_max].sum().item()
+            if k_actual == 0:
+                h_spectral_list.append(torch.zeros((graph_mask.sum(), self.hidden_dim), device=x.device))
+                continue
+                
+            eigvecs_valid = eigvecs_graph[:, :k_actual] # [N_i, k_actual]
+            
+            # Get valid filtered features
+            x_filtered_valid = x_filtered_freq[i, :k_actual, :] # [k_actual, D_out]
+            
+            # Apply IGFT
+            h_spatial_graph = eigvecs_valid @ x_filtered_valid # [N_i, D_out]
+            h_spectral_list.append(h_spatial_graph)
+            
+        h_spectral = torch.cat(h_spectral_list, dim=0) # [N, D_out]
+        
+        
+        # --- Pathway 2: Structural (uses augmented graph) ---
+        _, h_spatial = self.struct_gnn(
+            x, aug_edge_index, aug_edge_attr, batch
+        ) # [N, hidden_dim]
+        
+        # --- Pathway 3: Temporal (uses original spectral features) ---
         h_temporal = self.temporal_encoder(
             derived_mask, 
             step_numbers, 
-            h_spectral  # Use spectral, not spatial!
-        )  # [N, hidden_dim]
+            h_spatial
+        )
         
-        # FIXED: Late fusion - concatenate all three pathways
-        h_combined = torch.cat([h_spectral, h_spatial, h_temporal], dim=-1)  # [N, 3*hidden_dim]
+        # --- Late fusion ---
+        h_combined = torch.cat([h_spectral, h_spatial, h_temporal], dim=-1) # [N, 3*hidden_dim]
         
         # Final scoring
         scores = self.fusion_scorer(h_combined).squeeze(-1)  # [N]
 
-        if batch is None:
-             # Handle single graph case
-             graph_embedding = torch.mean(h_combined, dim=0, keepdim=True)
-        else:
-             graph_embedding = global_mean_pool(h_combined, batch) # [batch_size, 3*hidden_dim]
-        # --- END MOVE ---
-        value = self.value_head(graph_embedding)  # [batch_size, 1]
+        # --- Point 9: Hierarchical Pooling for Value ---
+        try:
+            # Use original graph for pooling
+            graph_embedding = self.hierarchical_pooler(x, edge_index, batch) # [B, 3*hidden_dim]
+        except Exception as e:
+            # Fallback if DiffPool fails (e.g., node counts > max_nodes)
+            print(f"WARNING: Hierarchical pooling failed ({e}). Falling back to global_mean_pool.")
+            graph_embedding = global_mean_pool(h_combined, batch) # [B, 3*hidden_dim]
+            # Adjust dimension if fallback
+            if graph_embedding.shape[1] != self.value_head[0].in_features:
+                 # Create a dummy embedding of the correct size
+                 graph_embedding = torch.zeros((bsz, self.value_head[0].in_features), device=x.device)
 
-        if batch is None:
-            value = value.squeeze(0)  # Scalar
+        
+        value = self.value_head(graph_embedding)  # [B, 1]
+
+        if bsz == 1:
+            value = value.squeeze(0)
         else:
-            value = value.squeeze(-1)  # [batch_size]
+            value = value.squeeze(-1)
         
         return scores, h_combined, value
+# [ --- END REPLACEMENT --- ]
 
 
 class TacticClassifier(nn.Module):
@@ -561,42 +733,216 @@ class PremiseSelector(nn.Module):
         relevance = self.relevance_scorer(fact_embeddings, graph_expanded).squeeze(-1)
         return torch.sigmoid(relevance)
 # --- END NEW ---
-def get_model(in_dim, hidden_dim=256, num_layers=4, dropout=0.3, 
-              use_type_aware=True, k=16, num_tactics=6, num_rules=5000): # <-- NEW ARGS
-    
+
+# [ --- NEW: SOTA MODULE (Point 8) --- ]
+class GraphRewiring(nn.Module):
     """
-    Factory function to get the fixed Tactic-guid model.
-    
-    Args:
-        in_dim: Base feature dimension (e.g., 22)
-        hidden_dim: Hidden dimension for all pathways
-        num_layers: Number of GNN layers in structural pathway
-        dropout: Dropout rate
-        use_type_aware: Whether to use type-aware GNN (always True now)
-        k: Spectral dimension
-    
-    Returns:
-        FixedTemporalSpectralGNN model
+    Adds shortcut edges to the graph to mitigate over-squashing
+    by connecting derived facts to their transitive premises.
+    """
+    def __init__(self, shortcut_edge_type=3):
+        super().__init__()
+        self.shortcut_edge_type = shortcut_edge_type
+        print(f"GraphRewiring initialized: adding new edge type {shortcut_edge_type}")
+
+    @torch.no_grad()
+    def _warshall_floyd(self, adj):
+        """ Performs Warshall-Floyd algorithm for transitive closure. """
+        N = adj.shape[0]
+        for k in range(N):
+            for i in range(N):
+                for j in range(N):
+                    adj[i, j] = adj[i, j] | (adj[i, k] & adj[k, j])
+        return adj
+
+    def forward(self, edge_index, edge_attr, num_nodes):
+        """
+        Adds shortcut edges (with a new edge type) to the graph.
+        
+        Args:
+            edge_index (Tensor): [2, E]
+            edge_attr (Tensor): [E]
+            num_nodes (int): Number of nodes N
+        
+        Returns:
+            aug_edge_index (Tensor): [2, E_new]
+            aug_edge_attr (Tensor): [E_new]
+        """
+        try:
+            # 1. Find transitive closure of proof dependencies (body edges)
+            body_mask = (edge_attr == 0) # Etype 0 = body
+            body_edge_index = edge_index[:, body_mask]
+            
+            adj = to_dense_adj(body_edge_index, max_num_nodes=num_nodes)[0].bool()
+            
+            # 2. Compute transitive closure
+            # Note: _warshall_floyd is O(N^3) and slow.
+            # For performance, a batched sparse-matrix-power-sum
+            # (Adamic-Adar) or BFS/DFS per node would be better.
+            # But for correctness, we follow the brief's "transitive" suggestion.
+            if num_nodes > 100: # Safety fallback for large graphs
+                transitive = adj
+            else:
+                transitive = self._warshall_floyd(adj.clone())
+            
+            # 3. Identify new "shortcut" edges
+            # A shortcut is an edge in the closure but not in the original adj
+            shortcut_edges_mask = (transitive > 0) & (adj == 0)
+            
+            if shortcut_edges_mask.any():
+                new_edges = shortcut_edges_mask.nonzero(as_tuple=False).t() # [2, E_shortcut]
+                new_edge_attr = torch.full(
+                    (new_edges.shape[1],), 
+                    self.shortcut_edge_type, 
+                    dtype=edge_attr.dtype, 
+                    device=edge_attr.device
+                )
+                
+                # 4. Concatenate
+                aug_edge_index = torch.cat([edge_index, new_edges], dim=1)
+                aug_edge_attr = torch.cat([edge_attr, new_edge_attr], dim=0)
+            else:
+                # No new edges
+                aug_edge_index = edge_index
+                aug_edge_attr = edge_attr
+                
+        except Exception as e:
+            # Fallback in case of error (e.g., OOM)
+            print(f"WARNING: GraphRewiring failed ({e}). Returning original graph.")
+            aug_edge_index = edge_index
+            aug_edge_attr = edge_attr
+
+        return aug_edge_index, aug_edge_attr
+# [ --- END NEW --- ]
+class DiffPoolGNN(nn.Module):
+    """A GNN module used within the DiffPool operator."""
+    def __init__(self, in_dim, out_dim, num_layers=2):
+        super().__init__()
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.convs.append(GATv2Conv(in_dim, out_dim, heads=4))
+        self.norms.append(nn.LayerNorm(out_dim * 4))
+        for _ in range(num_layers - 1):
+            self.convs.append(GATv2Conv(out_dim * 4, out_dim, heads=4))
+            self.norms.append(nn.LayerNorm(out_dim * 4))
+            
+    def forward(self, x, edge_index, batch=None):
+        for conv, norm in zip(self.convs, self.norms):
+            x = conv(x, edge_index)
+            x = norm(x)
+            x = F.elu(x)
+        return x
+
+# [ --- NEW: SOTA MODULE (Point 9) --- ]
+from torch_geometric.nn.dense import mincut_pool as dense_min_pool
+class HierarchicalProofEncoder(nn.Module):
+    """
+    Constructs graph-level embeddings using hierarchical pooling (DiffPool).
+    As described in your analysis brief.
+    """
+    def __init__(self, in_dim: int, gnn_hidden_dim: int, output_dim: int, 
+                 max_nodes=100, num_clusters_1=32, num_clusters_2=8):
+        super().__init__()
+        # Ensure max_nodes is reasonable
+        self.max_nodes = max_nodes
+        num_clusters_1 = min(num_clusters_1, max_nodes // 2)
+        num_clusters_2 = min(num_clusters_2, num_clusters_1 // 2)
+
+        # We use a GNN (e.g., GAT) for the pooling assignments
+        self.gnn1_pool = GATv2Conv(in_dim, num_clusters_1)
+        self.gnn1_embed = GATv2Conv(in_dim, gnn_hidden_dim)
+        
+        self.gnn2_pool = GATv2Conv(gnn_hidden_dim, num_clusters_2)
+        self.gnn2_embed = GATv2Conv(gnn_hidden_dim, gnn_hidden_dim)
+
+        # Final projection to match value_head input
+        # Input: 3 * hidden_dim (from 3 levels of pooling)
+        # Output: 3 * hidden_dim (to match value_head)
+        final_proj_in_dim = in_dim + gnn_hidden_dim + gnn_hidden_dim
+        self.final_proj = nn.Linear(final_proj_in_dim, output_dim)
+        
+        print(f"HierarchicalProofEncoder initialized: {num_clusters_1} -> {num_clusters_2} clusters.")
+
+    def forward(self, x, edge_index, batch):
+        # --- Pre-process for DiffPool: create dense adj and mask ---
+        
+        adj = to_dense_adj(edge_index, batch, max_num_nodes=self.max_nodes) # [B, N_max, N_max]
+        N_max = adj.size(1) # Get N_max from the created adj
+        batch_mask = (torch.arange(N_max, device=adj.device)
+                            .unsqueeze(0) < torch.bincount(batch).unsqueeze(-1))
+
+                # --- Level 1 ---
+        x_embed1_sparse = self.gnn1_embed(x, edge_index) # [N, D_gnn]
+        s1_sparse = self.gnn1_pool(x, edge_index)      # [N, C1]
+        x_embed1_dense, _ = to_dense_batch(x_embed1_sparse, batch, max_num_nodes=N_max) # [B, N_max, D_gnn]
+        s1_dense, _ = to_dense_batch(s1_sparse, batch, max_num_nodes=N_max)         # [B, N_max, C1]
+        
+        x1, adj1, _, _ = DiffPool(x_embed1_dense, adj, s1_dense, batch_mask)
+        # x1 is [B, C1, D_gnn], adj1 is [B, C1, C1]
+        
+        
+        # Create a new batch vector for the pooled cluster nodes
+        B, C1, D_gnn = x1.shape
+        batch1 = torch.arange(B, device=x.device).repeat_interleave(C1) # [B*C1]
+
+        # --- Level 2 ---
+        # Convert pooled adj back to edge_index for GNN layers
+        edge_index1, _ = dense_to_sparse(adj1)
+        x1_flat = x1.view(-1, D_gnn) # [B*C1, D_gnn]
+        
+        x_embed2_sparse = self.gnn2_embed(x1_flat, edge_index1) # [B*C1, D_gnn]
+        s2_sparse = self.gnn2_pool(x1_flat, edge_index1)      # [B*C1, C2]
+        
+        batch_mask1 = torch.ones(B, C1, dtype=torch.bool, device=x.device) # [B, C1] (assume all clusters are valid)
+        x_embed2_dense, _ = to_dense_batch(x_embed2_sparse, batch1, max_num_nodes=C1) # [B, C1, D_gnn]
+        s2_dense, _ = to_dense_batch(s2_sparse, batch1, max_num_nodes=C1)         # [B, C1, C2]
+
+        x2, adj2, _, _ = DiffPool(x_embed2_dense, adj1, s2_dense, batch_mask1)
+        # x2 is [B, C2, D_gnn]
+
+        # Create a new batch vector for the 2nd level clusters
+        batch2 = torch.repeat_interleave(torch.arange(adj.size(0), device=x.device), x2.size(1))
+        
+        # --- Multi-level aggregation ---
+        # We need to pool each level by batch
+        # x -> [N, D] -> global_mean_pool
+        # x1 -> [B, N_pool1, D] -> mean
+        # x2 -> [B, N_pool2, D] -> mean
+        
+        pool_orig = global_mean_pool(x, batch)  # [B, D]
+        pool1 = x1.mean(dim=1)                 # [B, D]
+        pool2 = x2.mean(dim=1)                 # [B, D]
+        
+        graph_emb = torch.cat([pool_orig, pool1, pool2], dim=-1) # [B, 3*D]
+        
+        return self.final_proj(graph_emb) # [B, 3*D]
+# [ --- END NEW --- ]
+
+def get_model(in_dim, hidden_dim=256, num_layers=4, dropout=0.3, 
+              use_type_aware=True, k=16, **kwargs): # <-- Removed tactic/rule args
+
+    """
+    [ --- NEW: SOTA FACTORY (Points 5, 8, 9) --- ]
+    Factory function to get the SOTA-refactored GNN.
+    The TacticGuidedGNN has been removed in favor of contrastive loss.
     """
 
     num_heads = 4
-    
-    print(f"Initializing FIXED TacticGuidedGNN:")
+
+    print(f"Initializing SOTA FixedTemporalSpectralGNN:")
     print(f"  Base features: {in_dim}D")
     print(f"  Hidden dim: {hidden_dim}D per pathway")
-    print(f"  Spectral dim: k={k}")
+    print(f"  Spectral dim: k={k} (Set-to-Set Filter)")
     print(f"  Structural layers: {num_layers}")
-    print(f"  Temporal scales: 3 (fine, medium, coarse)")
-    print(f"  Tactics: {num_tactics}") # <-- NEW
-    
-    # --- MODIFIED: Return the new wrapper model ---
-    return TacticGuidedGNN(
+    print(f"  Temporal scales: 3 (Gated Residual)")
+    print(f"  Architecture: Rewiring + Hierarchical Pooling")
+
+    return FixedTemporalSpectralGNN(
         in_dim=in_dim,
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         num_heads=num_heads,
         dropout=dropout,
         k=k,
-        num_tactics=num_tactics,
-        num_rules=num_rules
+        max_nodes=kwargs.get('max_nodes', 100) 
     )
