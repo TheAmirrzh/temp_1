@@ -644,24 +644,32 @@ class StepPredictionDataset(Dataset):
         # ========================================================================
         return pyg_data
 
+    
     def _estimate_difficulty(self, metadata: dict) -> float:
         """
-        FIXED: Properly scaled difficulty estimation.
-        Maps instances to [0, 1] range with better discrimination.
+        FIXED: Properly scaled difficulty estimation
+        Maps instances to [0, 1] range with better discrimination
         """
+        # Get raw metrics
         n_rules = metadata.get('n_rules', 10)
         n_nodes = metadata.get('n_nodes', 20)
         proof_length = metadata.get('proof_length', 5)
         
-        # Normalize using ranges from generation parameters
-        rule_score = min(n_rules / 40.0, 1.0)
-        node_score = min(n_nodes / 70.0, 1.0)
-        proof_score = min(proof_length / 15.0, 1.0)
+        # Define expected ranges per difficulty (from your generation params)
+        # Easy: 4 rules, 12 nodes, 3 steps
+        # Medium: 12 rules, 20 nodes, 5 steps  
+        # Hard: 20 rules, 35 nodes, 8 steps
+        # Very Hard: 35 rules, 60 nodes, 12 steps
         
-        # Weighted (heavier on proof length - most indicative)
+        # Normalize using non-linear scaling (captures spread better)
+        rule_score = min(n_rules / 40.0, 1.0)  # Cap at 40 rules
+        node_score = min(n_nodes / 70.0, 1.0)  # Cap at 70 nodes
+        proof_score = min(proof_length / 15.0, 1.0)  # Cap at 15 steps
+        
+        # Weighted combination (heavier on proof length - most indicative)
         difficulty = (0.3 * rule_score + 
-                      0.2 * node_score + 
-                      0.5 * proof_score)
+                    0.2 * node_score + 
+                    0.5 * proof_score)
         
         return min(max(difficulty, 0.0), 1.0)
 

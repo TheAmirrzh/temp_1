@@ -205,7 +205,172 @@ class ProofSearchRankingLoss(nn.Module):
         loss = ApplicabilityConstrainedLoss(margin=self.margin)
         return loss(scores, embeddings, target_idx, applicable_mask)
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-def get_recommended_loss():
-    """Returns the FIXED loss for this task."""
-    return ApplicabilityConstrainedLoss(margin=1.0, penalty_nonapplicable=100.0)
+
+# --- NEW: Masked Softmax Cross-Entropy Loss ---
+class MaskedCrossEntropyLoss(nn.Module):
+    """
+    Computes Cross-Entropy loss only over applicable rules.
+    Assumes scores are logits.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, scores, embeddings, target_idx, applicable_mask=None):
+        """
+        Args:
+            scores: [N] node scores (logits)
+            embeddings: [N, D] (IGNORED - kept for API compatibility)
+            target_idx: index of correct rule
+            applicable_mask: [N] boolean mask of which rules are applicable
+
+        Returns:
+            loss (scalar tensor)
+        """
+        n = len(scores)
+
+        # Basic validation
+        if target_idx < 0 or target_idx >= n:
+            # Invalid target, return a non-infinite loss to avoid crashing, but log it.
+            print(f"Warning: Invalid target_idx ({target_idx}) in MaskedCrossEntropyLoss.")
+            # Return a small loss, requires_grad=True if scores requires grad
+            return torch.tensor(0.01, device=scores.device, requires_grad=scores.requires_grad)
+
+        if applicable_mask is None:
+            # If no mask provided, assume all are applicable (fallback, but should be avoided)
+            applicable_mask = torch.ones_like(scores, dtype=torch.bool)
+            print("Warning: No applicable_mask provided to MaskedCrossEntropyLoss. Assuming all applicable.")
+
+        # CRITICAL: Target must be applicable
+        if not applicable_mask[target_idx]:
+            # This indicates a data inconsistency. The target *must* be applicable.
+            # Return a large but finite loss and log a critical warning.
+            print(f"CRITICAL WARNING: Target index {target_idx} is NOT applicable according to the mask!")
+            # Use a large, grad-requiring tensor if scores require grad
+            return torch.tensor(100.0, device=scores.device, requires_grad=scores.requires_grad)
+
+        # --- Core Logic ---
+        # 1. Get indices of applicable nodes
+        applicable_indices = applicable_mask.nonzero(as_tuple=True)[0]
+
+        # Handle case where only the target is applicable (no competition)
+        if applicable_indices.numel() <= 1:
+             # If only the target is applicable, loss should ideally be 0
+             # (perfect prediction among choices).
+             return torch.tensor(0.0, device=scores.device, requires_grad=scores.requires_grad)
+
+
+        # 2. Gather scores for applicable nodes
+        applicable_scores = scores[applicable_indices]
+
+        # 3. Find the relative index of the target within the applicable set
+        # This uses broadcasting and nonzero to find the position
+        relative_target_idx_mask = (applicable_indices == target_idx)
+        
+        # Ensure the target was actually found (redundant due to earlier check, but safe)
+        if not relative_target_idx_mask.any():
+            print(f"INTERNAL ERROR: Target index {target_idx} not found in applicable indices {applicable_indices.tolist()} despite passing initial check!")
+            return torch.tensor(100.0, device=scores.device, requires_grad=scores.requires_grad)
+
+        relative_target_idx = relative_target_idx_mask.nonzero(as_tuple=True)[0]
+        
+        # Ensure it's a scalar tensor (0-dim) for cross_entropy
+        if relative_target_idx.dim() > 0:
+            relative_target_idx = relative_target_idx.squeeze()
+            if relative_target_idx.dim() > 0: # Check again after squeeze
+                 relative_target_idx = relative_target_idx[0] # Take the first if still not scalar
+
+        # Ensure target is scalar tensor
+        if relative_target_idx.dim() > 0:
+            print(f"Warning: relative_target_idx is not scalar: {relative_target_idx}. Taking first element.")
+            relative_target_idx = relative_target_idx[0].unsqueeze(0) # Keep as tensor [1]
+        else:
+            relative_target_idx = relative_target_idx.unsqueeze(0) # Make it tensor([idx]) shape [1]
+
+
+        # 4. Compute Cross-Entropy Loss
+        # F.cross_entropy expects logits [Batch, Classes] and target [Batch]
+        # Here, Batch=1, Classes=num_applicable
+        loss = F.cross_entropy(
+            applicable_scores.unsqueeze(0), # Shape: [1, num_applicable]
+            relative_target_idx           # Shape: [1]
+        )
+        return loss
+
+class TripletLossWithHardMining(nn.Module):
+    """
+    Computes Triplet Loss focusing on the hardest negative applicable rule.
+
+    Loss = max(0, margin - (score_positive - score_hardest_negative))
+    """
+    def __init__(self, margin=1.0):
+        super().__init__()
+        self.margin = margin
+        print(f"Initialized TripletLossWithHardMining with margin={self.margin}")
+
+    def forward(self, scores, embeddings, target_idx, applicable_mask=None):
+        """
+        Args:
+            scores: [N] node scores (logits)
+            embeddings: [N, D] (IGNORED - loss uses scores directly)
+            target_idx: index of correct rule (positive)
+            applicable_mask: [N] boolean mask of which rules are applicable
+
+        Returns:
+            loss (scalar tensor)
+        """
+        n = len(scores)
+
+        # Basic validation
+        if target_idx < 0 or target_idx >= n:
+            print(f"Warning: Invalid target_idx ({target_idx}) in TripletLossWithHardMining.")
+            return torch.tensor(0.01, device=scores.device, requires_grad=scores.requires_grad)
+
+        if applicable_mask is None:
+            applicable_mask = torch.ones_like(scores, dtype=torch.bool)
+            print("Warning: No applicable_mask provided to TripletLossWithHardMining.")
+
+        # Ensure target is applicable
+        if not applicable_mask[target_idx]:
+            print(f"CRITICAL WARNING: Target index {target_idx} is NOT applicable in TripletLoss!")
+            return torch.tensor(100.0, device=scores.device, requires_grad=scores.requires_grad)
+
+        # --- Core Triplet Logic ---
+        positive_score = scores[target_idx]
+
+        # 1. Identify applicable negative indices
+        is_target_mask = torch.arange(n, device=scores.device) == target_idx
+        negative_applicable_mask = applicable_mask & ~is_target_mask
+        negative_applicable_indices = negative_applicable_mask.nonzero(as_tuple=True)[0]
+
+        # 2. Handle case with no applicable negatives
+        if negative_applicable_indices.numel() == 0:
+            # No competitors, loss is 0
+            return torch.tensor(0.0, device=scores.device, requires_grad=scores.requires_grad)
+
+        # 3. Find the hardest negative (highest score among applicable negatives)
+        negative_scores = scores[negative_applicable_indices]
+        hardest_negative_score = torch.max(negative_scores)
+
+        # 4. Compute Triplet Loss
+        loss = F.relu(self.margin - (positive_score - hardest_negative_score))
+
+        return loss
+
+def get_recommended_loss(loss_type='triplet_hard', margin=1.0): # Add margin arg
+    """Returns the recommended loss function."""
+    if loss_type == 'applicability_constrained':
+        print("Using Loss: ApplicabilityConstrainedLoss")
+        return ApplicabilityConstrainedLoss(margin=margin, penalty_nonapplicable=10.0)
+    elif loss_type == 'cross_entropy':
+        print("Using Loss: MaskedCrossEntropyLoss")
+        return MaskedCrossEntropyLoss()
+    elif loss_type == 'triplet_hard':
+        print(f"Using Loss: TripletLossWithHardMining (margin={margin})")
+        return TripletLossWithHardMining(margin=margin)
+    else:
+        print(f"Warning: Unknown loss_type '{loss_type}'. Defaulting to TripletLossWithHardMining.")
+        return TripletLossWithHardMining(margin=margin) # Default to Triplet
