@@ -493,6 +493,41 @@ def generate_horn_instance_deterministic(
         }
     }
 
+def validate_proof_execution_order(proof_steps, nodes, initial_atoms, rules):
+    """
+    CRITICAL: Validate that each step's rule is actually applicable when executed.
+    
+    Returns:
+        (is_valid, error_message, invalid_step_idx)
+    """
+    known_atoms = set(initial_atoms)
+    rule_map = {r["rule_nid"]: r for r in rules}
+    
+    for step_idx, step in enumerate(proof_steps):
+        rule_nid = step["used_rule"]
+        derived_nid = step["derived_node"]
+        
+        # Get rule and derived fact
+        if rule_nid not in rule_map:
+            return False, f"Rule {rule_nid} not found", step_idx
+        
+        rule = rule_map[rule_nid]
+        body_atoms = set(rule["body_atoms"])
+        head_atom = rule["head_atom"]
+        
+        # Check 1: All premises must be known
+        if not body_atoms.issubset(known_atoms):
+            missing = body_atoms - known_atoms
+            return False, f"Missing premises: {missing}", step_idx
+        
+        # Check 2: Head must NOT already be known (no redundant derivation)
+        if head_atom in known_atoms:
+            return False, f"Head already known: {head_atom}", step_idx
+        
+        # Mark as derived
+        known_atoms.add(head_atom)
+    
+    return True, "OK", -1
 
 def generate_dataset(
     output_dir: str,

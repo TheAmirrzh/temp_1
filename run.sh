@@ -11,6 +11,7 @@
 #    the dataset loaders to use this exact k-value, overriding auto-detection.
 #
 # ==============================================================================
+source "/Users/amirmac/WorkSpace/Codes/LogNet/Phase-2.5.2/.venv311/bin/activate"
 
 # --- Configuration ---
 
@@ -21,7 +22,7 @@ EXP_DIR="./experiment_results"
 VALIDATION_DIR="./validation_reports"
 
 # Path to your virtual environment's Python
-VENV_PYTHON="/Users/amirmac/WorkSpace/Codes/LogNet/.venv/bin/python"
+VENV_PYTHON="/Users/amirmac/WorkSpace/Codes/LogNet/Phase-2.5.2/.venv311/bin/activate"
 
 # Data Generation Config
 N_EASY=400
@@ -103,8 +104,6 @@ echo "   - Loss: ProofSearchRankingLoss (Fixed) + Value + Tactic"
     --batch-size $BATCH_SIZE \
     --hidden-dim $HIDDEN_DIM \
     --lr $LEARNING_RATE \
-    --value-loss-weight $VALUE_LOSS_WEIGHT \
-    --tactic-loss-weight $TACTIC_LOSS_WEIGHT \
     --k-dim $SPECTRAL_K \
     --num-layers $NUM_LAYERS # <-- ADD THIS LINE with your desired value
 echo "✅ Training complete. Results in $EXP_DIR."

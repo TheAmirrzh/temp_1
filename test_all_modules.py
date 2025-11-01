@@ -24,7 +24,7 @@ from torch.utils.data import SubsetRandomSampler, DataLoader
 # --- Import Project Modules ---
 # Note: Ensure these files are in the same directory or Python path
 try:
-    from data_generator import generate_horn_instance, generate_dataset, Difficulty
+    from data_generator import generate_horn_instance_deterministic, generate_dataset, Difficulty
     from dataset import StepPredictionDataset, create_split, RuleToTacticMapper
     from losses import ProofSearchRankingLoss, compute_hit_at_k, compute_mrr
     from model import (
@@ -89,7 +89,7 @@ class TestDataGenerator(unittest.TestCase):
 
     def test_01_generate_horn_instance(self):
         print("\nTesting data_generator.generate_horn_instance...")
-        instance = generate_horn_instance("test_gen_0", Difficulty.EASY, seed=42)
+        instance = generate_horn_instance_deterministic("test_gen_0", Difficulty.EASY, seed=42)
         self.assertIsInstance(instance, dict)
         self.assertIn("id", instance)
         self.assertIn("nodes", instance)
