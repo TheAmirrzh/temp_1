@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 FIXED: Horn Clause Generator with Deterministic, Verifiable Proofs
 
@@ -6,6 +7,8 @@ Key Fixes:
 2. All proofs are verified before output
 3. No random step ordering
 4. Deterministic rule selection
+5. FIXED: Robust topological sort in `reorder_proof_steps` to
+   prevent "unreachable steps" bug.
 """
 
 import json
@@ -124,57 +127,67 @@ class ProofVerifier:
 
 def reorder_proof_steps(proof_steps, fact_map, initial_atoms, rules, rule_map):
     """
-    FIXED: Better topological sort with dependency tracking
+    FIXED: Robust topological sort (Kahn's algorithm)
+    This fixes the "unreachable steps" bug by only checking for premise
+    satisfaction, not whether the head is already known.
     """
     if not proof_steps:
         return []
-    
-    # Build dependency graph
-    atom_to_step = {}  # atom -> step that derives it
-    step_dependencies = {}  # step_id -> [required_atoms]
-    
-    for step in proof_steps:
-        rule_nid = step["used_rule"]
-        if rule_nid not in rule_map:
-            continue
-        
-        rule_info = rule_map[rule_nid]
-        head_atom = rule_info["head_atom"]
-        body_atoms = rule_info["body_atoms"]
-        
-        atom_to_step[head_atom] = step
-        step_dependencies[step["step_id"]] = body_atoms
-    
-    # Topological sort using Kahn's algorithm
+
     known_atoms = set(initial_atoms)
     ordered_steps = []
-    remaining_steps = list(proof_steps)
     
-    max_iterations = len(remaining_steps) * 2
-    iterations = 0
-    
-    while remaining_steps and iterations < max_iterations:
-        iterations += 1
-        made_progress = False
+    # Use a set of step_ids for efficient removal
+    remaining_step_ids = {step['step_id'] for step in proof_steps}
+    step_map = {step['step_id']: step for step in proof_steps}
+    # rule_map is already passed in, but ensure it's correct
+    if not rule_map:
+         rule_map = {r["rule_nid"]: r for r in rules}
+
+    max_iterations = len(remaining_step_ids)
+    # Loop one extra time than num_steps to detect cycles
+    for _ in range(max_iterations + 1): 
+        if not remaining_step_ids:
+            break # All steps ordered
         
-        for i, step in enumerate(remaining_steps):
+        made_progress = False
+        steps_to_remove = set()
+        
+        for step_id in remaining_step_ids:
+            step = step_map[step_id]
             rule_nid = step["used_rule"]
+            
+            if rule_nid not in rule_map:
+                continue # Should not happen, but safe
+                
             rule_info = rule_map[rule_nid]
             body_atoms = set(rule_info["body_atoms"])
             head_atom = rule_info["head_atom"]
             
-            # Can execute if: body satisfied AND head not known
-            if body_atoms.issubset(known_atoms) and head_atom not in known_atoms:
-                known_atoms.add(head_atom)
+            # --- THIS IS THE FIX ---
+            # A step is executable if all its premises are known.
+            # We DON'T care if the head is already known during re-ordering.
+            if body_atoms.issubset(known_atoms):
+                # This step can be executed
                 ordered_steps.append(step)
-                remaining_steps.pop(i)
+                known_atoms.add(head_atom) # Add its conclusion to known set
+                steps_to_remove.add(step_id)
                 made_progress = True
-                break
         
-        if not made_progress:
-            # Remaining steps are unreachable
-            print(f"WARNING: Discarding {len(remaining_steps)} unreachable steps")
-            break
+        if not made_progress and remaining_step_ids:
+            # This means we have a cycle or truly unreachable steps
+            print(f"WARNING: Discarding {len(remaining_step_ids)} unreachable steps (cycle or missing premises).")
+            # For example, print one problematic step
+            try:
+                step_id = list(remaining_step_ids)[0]
+                rule_info = rule_map[step_map[step_id]["used_rule"]]
+                missing = set(rule_info["body_atoms"]) - known_atoms
+                print(f"  -> Example: Step {step_id} (Rule {step_map[step_id]['used_rule']}) missing premises: {missing}")
+            except Exception as e:
+                print(f"  -> Error printing debug info for unreachable step: {e}")
+            break # Exit loop
+        
+        remaining_step_ids -= steps_to_remove
     
     # Assign sequential IDs
     for i, step in enumerate(ordered_steps):
@@ -337,7 +350,7 @@ def generate_horn_instance_deterministic(
                 "is_initial": False
             }
             nodes.append(fact_node)
-            fact_map[head_atom] = nid_counter
+            fact_map[atom] = nid_counter
             nid_counter += 1
         
         edges.append({
@@ -433,7 +446,7 @@ def generate_horn_instance_deterministic(
                 premise_nids = [fact_map[a] for a in body_atoms]
                 
                 proof_steps.append({
-                    "step_id": len(proof_steps),
+                    "step_id": len(proof_steps), # Temporary ID
                     "derived_node": derived_nid,
                     "used_rule": rule_nid,
                     "premises": premise_nids
@@ -517,45 +530,4 @@ def generate_dataset(
                     json.dump(inst, f, indent=2)
                 valid_count += 1
         
-        stats["by_difficulty"][diff.value] = valid_count
-        stats["total"] += valid_count
-        
-        if valid_count < count:
-            print(f"  ⚠ Only generated {valid_count}/{count} valid instances")
-        else:
-            print(f"  ✓ {valid_count} instances")
-    
-    print(f"\nTotal valid instances: {stats['total']}")
-    return stats
-
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Generate Horn clause dataset (FIXED).")
-    parser.add_argument('--output-dir', type=str, required=True, help='Directory to save the dataset')
-    parser.add_argument('--easy', type=int, default=0, help='Number of easy instances')
-    parser.add_argument('--medium', type=int, default=0, help='Number of medium instances')
-    parser.add_argument('--hard', type=int, default=0, help='Number of hard instances')
-    parser.add_argument('--very-hard', type=int, default=0, help='Number of very_hard instances')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    
-    args = parser.parse_args()
-
-    difficulty_counts = {}
-    if args.easy > 0:
-        difficulty_counts[Difficulty.EASY] = args.easy
-    if args.medium > 0:
-        difficulty_counts[Difficulty.MEDIUM] = args.medium
-    if args.hard > 0:
-        difficulty_counts[Difficulty.HARD] = args.hard
-    if args.very_hard > 0:
-        difficulty_counts[Difficulty.VERY_HARD] = args.very_hard
-
-    if not difficulty_counts:
-        print("No instances requested. Exiting.")
-    else:
-        generate_dataset(
-            args.output_dir,
-            difficulty_counts,
-            seed=args.seed
-        )
+        stats

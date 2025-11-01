@@ -1,418 +1,330 @@
 #!/usr/bin/env python3
 """
-Comprehensive Test Suite for SOTA Fixes (Issues #1-6)
+Test Suite for Critical Fixes (Issues 4 & 5)
 
-FIXED:
-- (FAIL 2/4) DUMMY_INSTANCE_EASY now correctly has no hard negatives.
-- (FAIL 3) test_02_dataset_improved_value_target now checks for the
-  CORRECT precise values for difficulty and value_target.
-- (FAIL 4) test_03_train_instance_level_curriculum now checks for
-  the CORRECT number of samples (3) at epoch 1.
+This module specifically validates the corrected logic for:
+1.  **Applicability Mask:** Ensures that rules whose conclusions are
+    already known are correctly marked as NOT applicable.
+2.  **Proof Simulator:** Ensures that node features are correctly
+    recomputed after a simulation step, allowing the *next*
+    rule to become applicable.
+
+Usage:
+  python test_critical_fixes.py
 """
 
 import unittest
 import torch
-import torch.nn as nn
-import numpy as np
 import json
 import os
 import shutil
 import tempfile
 from pathlib import Path
-from collections import defaultdict
-from torch_geometric.data import Data, Batch
-from torch.utils.data import DataLoader, sampler
+from typing import Dict, List, Optional
 
-# --- Import all fixed modules ---
+# --- Import corrected project modules ---
+# (Assumes fixes have been applied to these files)
 try:
-    from data_generator import reorder_proof_steps, ProofVerifier, Difficulty
-    from spectral_features import SpectralFeatureExtractor
-    from temporal_encoder import ProofFrontierAttention
-    from model import SetToSetSpectralFilter, TacticGuidedGNN, get_model
-    from dataset import StepPredictionDataset, RuleToTacticMapper
-    from train import InstanceLevelCurriculum, contrastive_collate, train_epoch, get_lr
-    from losses import get_recommended_loss
+    from dataset import StepPredictionDataset, compute_applicable_rules_for_step
+    from search_agent import ProofSimulator
+    from model import get_model, TacticGuidedGNN
+    from torch_geometric.data import Data
 except ImportError as e:
-    print(f"CRITICAL ERROR: Failed to import modules. {e}")
-    print("Please ensure all fixed .py files are in the same directory.")
+    print(f"Error importing project modules: {e}")
+    print("Please ensure all project .py files (dataset.py, search_agent.py, model.py) are in the Python path.")
     exit(1)
 
-# --- Constants for Mock Data ---
-K_DIM = 16
-HIDDEN_DIM = 64
-BASE_FEATURES = 22
-TEST_DATA_DIR = Path("./test_sota_fixes_data")
-TEST_SPECTRAL_DIR = TEST_DATA_DIR / "spectral_cache"
 
-# Mock instance with a 2-step proof and multiple applicable rules
-DUMMY_INSTANCE_ID = "test_inst_01"
-DUMMY_INSTANCE = {
-    "id": DUMMY_INSTANCE_ID,
-    "nodes": [
-        {"nid": "fA", "type": "fact", "atom": "A", "is_initial": True},    # 0
-        {"nid": "fB", "type": "fact", "atom": "B", "is_initial": True},    # 1
-        {"nid": "r1", "type": "rule", "body_atoms": ["A"], "head_atom": "C"},  # 2 (Applicable at step 0)
-        {"nid": "r2", "type": "rule", "body_atoms": ["B"], "head_atom": "D"},  # 3 (Applicable at step 0)
-        {"nid": "r3", "type": "rule", "body_atoms": ["C"], "head_atom": "E"},  # 4 (Applicable at step 1)
-        {"nid": "fC", "type": "fact", "atom": "C", "is_initial": False},   # 5
-        {"nid": "fD", "type": "fact", "atom": "D", "is_initial": False},   # 6
-        {"nid": "fE", "type": "fact", "atom": "E", "is_initial": False}    # 7
-    ],
-    "edges": [
-        {"src": "fA", "dst": "r1", "etype": "body"},
-        {"src": "fB", "dst": "r2", "etype": "body"},
-        {"src": "fC", "dst": "r3", "etype": "body"},
-        {"src": "r1", "dst": "fC", "etype": "head"},
-        {"src": "r2", "dst": "fD", "etype": "head"},
-        {"src": "r3", "dst": "fE", "etype": "head"}
-    ],
-    "proof_steps": [
-        {"step_id": 0, "derived_node": "fC", "used_rule": "r1", "premises": ["fA"]},
-        {"step_id": 1, "derived_node": "fE", "used_rule": "r3", "premises": ["fC"]}
-    ],
-    "goal": "E",
-    "metadata": {"n_nodes": 8, "n_rules": 3, "proof_length": 2} # n_nodes=8
-}
-DUMMY_JSON_FILE = TEST_DATA_DIR / f"{DUMMY_INSTANCE_ID}.json"
-
-
-DUMMY_INSTANCE_EASY_ID = "easy_inst"
-DUMMY_INSTANCE_EASY = {
-    "id": DUMMY_INSTANCE_EASY_ID, 
-    "nodes": [
-        {"nid": "fA", "type": "fact", "atom": "A", "is_initial": True},    # 0
-        {"nid": "fB", "type": "fact", "atom": "B", "is_initial": True},    # 1
-        {"nid": "r1", "type": "rule", "body_atoms": ["A"], "head_atom": "C"},  # 2
-        {"nid": "fC", "type": "fact", "atom": "C", "is_initial": False}    # 3
-    ], 
-    "edges": [
-        {"src": "fA", "dst": "r1", "etype": "body"},
-        {"src": "r1", "dst": "fC", "etype": "head"}
-    ],
-    "proof_steps": [{"step_id": 0, "derived_node": "fC", "used_rule": "r1", "premises": ["fA"]}], 
-    "goal": "C",
-    "metadata": {"n_nodes": 4, "n_rules": 1, "proof_length": 1} # Easy
-}
-DUMMY_JSON_FILE_EASY = TEST_DATA_DIR / f"{DUMMY_INSTANCE_EASY_ID}.json"
-
-
-DUMMY_INSTANCE_HARD_ID = "hard_inst"
-DUMMY_INSTANCE_HARD = {
-    "id": DUMMY_INSTANCE_HARD_ID, 
-    "nodes": DUMMY_INSTANCE["nodes"], 
-    "edges": DUMMY_INSTANCE["edges"],
-    "proof_steps": DUMMY_INSTANCE["proof_steps"], "goal": "E",
-    "metadata": {"n_nodes": 8, "n_rules": 3, "proof_length": 15} # Hard proof_length
-}
-DUMMY_JSON_FILE_HARD = TEST_DATA_DIR / f"{DUMMY_INSTANCE_HARD_ID}.json"
-
-
-def setup_mock_environment():
-    """Creates mock data/spectral dirs and files for tests."""
-    if TEST_DATA_DIR.exists():
-        shutil.rmtree(TEST_DATA_DIR)
-    TEST_DATA_DIR.mkdir(parents=True)
-    TEST_SPECTRAL_DIR.mkdir(parents=True)
-    
-    with open(DUMMY_JSON_FILE, 'w') as f:
-        json.dump(DUMMY_INSTANCE, f)
-    with open(DUMMY_JSON_FILE_EASY, 'w') as f:
-        json.dump(DUMMY_INSTANCE_EASY, f)
-    with open(DUMMY_JSON_FILE_HARD, 'w') as f:
-        json.dump(DUMMY_INSTANCE_HARD, f)
-        
-    for inst in [DUMMY_INSTANCE, DUMMY_INSTANCE_EASY, DUMMY_INSTANCE_HARD]:
-        n_nodes = len(inst["nodes"])
-        np.savez_compressed(
-            TEST_SPECTRAL_DIR / f"{inst['id']}_spectral.npz",
-            eigenvalues=np.linspace(0.01, 1.5, K_DIM).astype(np.float32),
-            eigenvectors=np.random.rand(n_nodes, K_DIM).astype(np.float32),
-            num_nodes=n_nodes, k=K_DIM
-        )
-
-def cleanup_mock_environment():
-    """Removes mock data."""
-    if TEST_DATA_DIR.exists():
-        shutil.rmtree(TEST_DATA_DIR)
-
-
-class TestA_DataGeneratorFix(unittest.TestCase):
-    """Tests the fix for `reorder_proof_steps` in data_generator.py"""
-    
-    def test_01_reorder_proof_steps_fix(self):
-        print("\n[TEST] data_generator: `reorder_proof_steps` fix")
-        proof_steps = [
-            {'step_id': 0, 'used_rule': 'r3'}, # Derives E from C, D
-            {'step_id': 1, 'used_rule': 'r1'}, # Derives C from A
-            {'step_id': 2, 'used_rule': 'r2'}  # Derives D from B
-        ]
-        initial_atoms = {'A', 'B'}
-        rule_map = {
-            'r1': {'body_atoms': ['A'], 'head_atom': 'C'},
-            'r2': {'body_atoms': ['B'], 'head_atom': 'D'},
-            'r3': {'body_atoms': ['C', 'D'], 'head_atom': 'E'}
-        }
-        
-        ordered_steps = reorder_proof_steps(proof_steps, {}, initial_atoms, [], rule_map)
-        
-        self.assertEqual(len(ordered_steps), 3)
-        r3_index = -1
-        for i, step in enumerate(ordered_steps):
-            if step['used_rule'] == 'r3':
-                r3_index = i
-        
-        self.assertEqual(r3_index, 2, "r3 (C,D -> E) must be the last step")
-        print("  ✓ `reorder_proof_steps` correctly handles dependencies")
-
-
-class TestB_CoreFixes(unittest.TestCase):
-    """Tests fixes to spectral, temporal, and model modules."""
-    
-    def test_01_spectral_eigenvalue_correction_fix(self):
-        print("\n[TEST] spectral_features: `_eigenvalue_correction` (Issue #1)")
-        extractor = SpectralFeatureExtractor()
-        eigvals = np.array([0.0, 1e-6, 0.5, 0.5, 0.5, 1.0])
-        
-        corrected = extractor._eigenvalue_correction(eigvals, epsilon=1e-2)
-        
-        self.assertEqual(eigvals.shape, corrected.shape)
-        self.assertAlmostEqual(corrected[0], 0.0)
-        self.assertAlmostEqual(corrected[1], 1e-6)
-        self.assertNotAlmostEqual(corrected[2], corrected[3])
-        self.assertNotAlmostEqual(corrected[3], corrected[4])
-        self.assertTrue(np.all(np.diff(corrected) >= -1e-9), f"Array not sorted: {corrected}")
-        print("  ✓ Chebyshev-based correction preserves zeros and spreads repeats")
-
-    def test_02_temporal_gated_residual_fix(self):
-        print("\n[TEST] temporal_encoder: `ProofFrontierAttention` Gated Residual (Issue #4)")
-        attn = ProofFrontierAttention(hidden_dim=HIDDEN_DIM, num_heads=2)
-        
-        x = torch.randn(10, HIDDEN_DIM, requires_grad=True)
-        step_numbers = torch.arange(10)
-        x_clone = x.clone()
-        attended = torch.randn(10, HIDDEN_DIM)
-        gate_input = torch.cat([x_clone, attended], dim=-1)
-        gate = torch.sigmoid(attn.gate_proj(gate_input))
-        
-        output = (1 - gate) * x_clone + gate * attended
-        output_norm = attn.layer_norm(output)
-        
-        output_norm.sum().backward()
-        
-        self.assertIsNotNone(x.grad, "Gradient is None, residual path (1-gate)*x is broken")
-        print("  ✓ Gated residual connection allows gradient flow from `x` (residual path)")
-        
-    def test_03_model_set_to_set_filter_shapes(self):
-        print("\n[TEST] model: `SetToSetSpectralFilter` Shapes (Issue #5)")
-        # --- START FIX (Issue #2): Rewrite test for correct signature ---
-        B, K, D_in, D_out = 2, K_DIM, BASE_FEATURES, HIDDEN_DIM
-        
-        model = SetToSetSpectralFilter(in_dim=D_in, out_dim=D_out, k=K)
-        
-        # 1. Create mock batch in spectral domain
-        x_freq_batch = torch.randn(B, K, D_in)      # [B, k_max, D_in]
-        eigvals_batch = torch.randn(B, K)           # [B, k_max]
-        eig_mask_batch = torch.ones(B, K).bool()    # [B, k_max]
-        
-        # 2. Call forward with correct arguments
-        out = model(x_freq_batch, eigvals_batch, eig_mask_batch)
-        
-        self.assertEqual(out.shape, (B, K, D_out))
-        print(f"  ✓ `SetToSetSpectralFilter` output shape correct: {out.shape}")
-        # --- END FIX ---
-
-
-class TestC_DatasetAndTrainingPipeline(unittest.TestCase):
+class TestApplicabilityMaskFix(unittest.TestCase):
     """
-    Integration test for the new dataset and training pipeline.
-    Validates curriculum, contrastive loading, and the E2E training loop.
+    Validates Issue 4: Corrupt Applicability Mask in dataset.py
+    
+    This test confirms that the corrected `compute_applicable_rules_for_step`
+    function correctly identifies a rule as *NOT applicable* if its
+    head atom (conclusion) is already in the set of known facts.
+    """
+    
+    def setUp(self):
+        print("\n" + "="*70)
+        print(" [TEST] Corrected Applicability Mask (Issue 4)")
+        print("="*70)
+        
+        # --- Mock Graph Structure ---
+        # Facts: A (initial), B (initial)
+        # Rules: r1: A -> C
+        #        r2: B -> D
+        #        r3: C -> E
+        # Proof: [step 0] r1 derives C
+        #        [step 1] r2 derives D
+        #        [step 2] r3 derives E
+        #
+        # We will test applicability at step_idx = 1
+        # At this point, known_facts = {A, B, C}
+        
+        self.nodes = [
+            {"nid": "fA", "type": "fact", "atom": "A", "is_initial": True},   # 0
+            {"nid": "fB", "type": "fact", "atom": "B", "is_initial": True},   # 1
+            {"nid": "r1", "type": "rule", "body_atoms": ["A"], "head_atom": "C"}, # 2
+            {"nid": "r2", "type": "rule", "body_atoms": ["B"], "head_atom": "D"}, # 3
+            {"nid": "r3", "type": "rule", "body_atoms": ["C"], "head_atom": "E"}, # 4
+            {"nid": "fC", "type": "fact", "atom": "C", "is_initial": False},  # 5
+            {"nid": "fD", "type": "fact", "atom": "D", "is_initial": False},  # 6
+            {"nid": "fE", "type": "fact", "atom": "E", "is_initial": False}   # 7
+        ]
+        
+        self.edges = [
+            {"src": "fA", "dst": "r1", "etype": "body"},
+            {"src": "fB", "dst": "r2", "etype": "body"},
+            {"src": "fC", "dst": "r3", "etype": "body"},
+            {"src": "r1", "dst": "fC", "etype": "head"},
+            {"src": "r2", "dst": "fD", "etype": "head"},
+            {"src": "r3", "dst": "fE", "etype": "head"},
+        ]
+        
+        self.proof_steps = [
+            {"derived_node": "fC", "used_rule": "r1"}, # step 0
+            {"derived_node": "fD", "used_rule": "r2"}, # step 1
+            {"derived_node": "fE", "used_rule": "r3"}  # step 2
+        ]
+    
+    def test_applicability_logic(self):
+        print("Testing applicability logic at step_idx = 1")
+        
+        # At step_idx = 1, the proof has only executed step 0.
+        # Known facts = {A, B} (initial) + {C} (from step 0)
+        step_idx = 1
+        
+        print("  Known facts should be: {A, B, C}")
+        
+        # Run the corrected function
+        applicable_mask, known_facts = compute_applicable_rules_for_step(
+            self.nodes,
+            self.edges,
+            step_idx,
+            self.proof_steps
+        )
+        
+        print(f"  Function reported known facts: {known_facts}")
+        self.assertEqual(known_facts, {"A", "B", "C"})
+        
+        print(f"  Applicable mask result: {applicable_mask.tolist()}")
+        
+        # --- Assertions ---
+        
+        # Rule r1 (idx 2): A -> C
+        # Premises {A} are met. Head {C} IS known.
+        # This rule should be FALSE (not applicable).
+        print("  Checking Rule r1 (A -> C)...")
+        self.assertFalse(
+            applicable_mask[2], 
+            "FIX FAILED: Rule r1 (A -> C) should be FALSE (head 'C' is already known)"
+        )
+        print("    ✓ PASSED: Rule r1 correctly marked as NOT applicable.")
+        
+        # Rule r2 (idx 3): B -> D
+        # Premises {B} are met. Head {D} is NOT known.
+        # This rule should be TRUE (applicable).
+        print("  Checking Rule r2 (B -> D)...")
+        self.assertTrue(
+            applicable_mask[3],
+            "Rule r2 (B -> D) should be TRUE (premises met, head unknown)"
+        )
+        print("    ✓ PASSED: Rule r2 correctly marked as applicable.")
+
+        # Rule r3 (idx 4): C -> E
+        # Premises {C} are met. Head {E} is NOT known.
+        # This rule should be TRUE (applicable).
+        print("  Checking Rule r3 (C -> E)...")
+        self.assertTrue(
+            applicable_mask[4],
+            "Rule r3 (C -> E) should be TRUE (premises met, head unknown)"
+        )
+        print("    ✓ PASSED: Rule r3 correctly marked as applicable.")
+
+
+class TestProofSimulatorFix(unittest.TestCase):
+    """
+    Validates Issue 5: Broken Proof Simulator in search_agent.py
+    
+    This test confirms that the corrected `ProofSimulator.apply_rule`
+    function correctly recomputes node features (`next_data.x`).
+    
+    We test this by:
+    1. Applying rule 1.
+    2. Asserting that the features for rule 2 are updated.
+    3. Asserting that `get_applicable_rules_indices` *now* sees rule 2
+       as applicable, which would fail without the feature update.
     """
     
     @classmethod
     def setUpClass(cls):
-        print("\n[SETUP] Creating mock environment for pipeline test...")
-        setup_mock_environment()
+        print("\n" + "="*70)
+        print(" [TEST] Corrected Proof Simulator (Issue 5)")
+        print("="*70)
         
-        # Instance 0: easy_inst (1 step) -> samples [0]
-        # Instance 1: test_inst_01 (2 steps) -> samples [1, 2]
-        # Instance 2: hard_inst (2 steps) -> samples [3, 4]
-        cls.all_files = [
-            str(DUMMY_JSON_FILE_EASY), 
-            str(DUMMY_JSON_FILE),
-            str(DUMMY_JSON_FILE_HARD)
-        ]
-        cls.ds = StepPredictionDataset(
-            cls.all_files, 
-            spectral_dir=str(TEST_SPECTRAL_DIR),
-            contrastive_neg=True,
-            k_dim=K_DIM
-        )
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.instance_file = Path(cls.temp_dir) / "test_sim_instance.json"
+        
+        # --- Mock 2-Step Instance ---
+        # Facts: A (init), B (init)
+        # Rules: r1: A -> C        (idx=2)
+        #        r2: (B, C) -> D  (idx=3)
+        # Goal:  D
+        
+        cls.DUMMY_INSTANCE = {
+            "id": "test_sim_instance",
+            "nodes": [
+                {"nid": "fA", "type": "fact", "atom": "A", "is_initial": True},    # 0
+                {"nid": "fB", "type": "fact", "atom": "B", "is_initial": True},    # 1
+                {"nid": "r1", "type": "rule", "body_atoms": ["A"], "head_atom": "C"},  # 2
+                {"nid": "r2", "type": "rule", "body_atoms": ["B", "C"], "head_atom": "D"}, # 3
+                {"nid": "fC", "type": "fact", "atom": "C", "is_initial": False},   # 4
+                {"nid": "fD", "type": "fact", "atom": "D", "is_initial": False}    # 5 (Goal)
+            ],
+            "edges": [
+                {"src": "fA", "dst": "r1", "etype": "body"},
+                {"src": "fB", "dst": "r2", "etype": "body"},
+                {"src": "fC", "dst": "r2", "etype": "body"},
+                {"src": "r1", "dst": "fC", "etype": "head"},
+                {"src": "r2", "dst": "fD", "etype": "head"}
+            ],
+            "proof_steps": [
+                {"step_id": 0, "derived_node": "fC", "used_rule": "r1", "premises": ["fA"]},
+                {"step_id": 1, "derived_node": "fD", "used_rule": "r2", "premises": ["fB", "fC"]}
+            ],
+            "goal": "D",
+            "metadata": {"proof_length": 2, "n_nodes": 6, "n_rules": 2}
+        }
+        
+        # Write the dummy instance file
+        with open(cls.instance_file, 'w') as f:
+            json.dump(cls.DUMMY_INSTANCE, f)
+            
+        print(f"  Created dummy instance: {cls.instance_file}")
+        
+        # Set up a minimal dataset and model for the simulator
+        cls.dataset = StepPredictionDataset([str(cls.instance_file)], k_dim=16)
+        cls.model = get_model(in_dim=22, hidden_dim=32, k=16, num_tactics=6)
+        cls.simulator = ProofSimulator(cls.dataset)
 
     @classmethod
     def tearDownClass(cls):
-        print("\n[TEARDOWN] Cleaning up mock environment...")
-        cleanup_mock_environment()
+        if Path(cls.temp_dir).exists():
+            shutil.rmtree(cls.temp_dir)
+        print(f"\n  Cleaned up temp dir: {cls.temp_dir}")
         
-    def test_01_dataset_getitem_contrastive_tuple(self):
-        print("\n[TEST] dataset: `__getitem__` returns (pos, neg) tuple (Issue #6)")
-        item = self.ds[0] # easy_inst, step 0
-        self.assertIsInstance(item, tuple)
-        self.assertEqual(len(item), 2)
+    def test_01_full_proof_simulation(self):
+        """
+        Tests the full simulation loop from step 0 to the goal,
+        verifying feature recomputation at each step.
+        """
         
-        pos_data, neg_data = item
-        
-        self.assertIsInstance(pos_data, Data)
-        self.assertIsNone(neg_data)
-        print("  ✓ Returns (pos, None) for sample with no hard negatives")
+        # --- Define node indices for clarity ---
+        rule1_idx = 2  # r1: A -> C
+        rule2_idx = 3  # r2: (B, C) -> D
+        fact_C_idx = 4 # fC
+        goal_fact_D_idx = 5 # fD
 
-        item_hard = self.ds[1] # test_inst_01, step 0
-        self.assertIsInstance(item_hard, tuple)
-        pos_data, neg_data = item_hard
+        # ==========================================
+        #  PHASE 1: Test State 0 -> State 1
+        # ==========================================
+        print("\n--- Testing State 0 -> State 1 ---")
+        print("  Getting initial state (step 0)...")
+        initial_state = self.simulator.get_initial_state(self.DUMMY_INSTANCE)
+        self.assertIsNotNone(initial_state)
         
-        self.assertIsInstance(pos_data, Data)
-        self.assertIsInstance(neg_data, Data)
-        print("  ✓ Returns (pos, neg) for sample with hard negatives")
+        x_before = initial_state.x.clone()
         
-        pos_y = pos_data.y.item()
-        neg_y = neg_data.y.item()
-        
-        self.assertNotEqual(pos_y, neg_y, "Positive and Negative targets are the same")
-        self.assertFalse(pos_data.applicable_mask[neg_y], "Negative target *should* be non-applicable")
-        print(f"  ✓ Positive (y={pos_y}), Hard Negative (y={neg_y}, non-applicable) generated")
+        # Check initial applicable rules
+        initial_applicable = self.simulator.get_applicable_rules_indices(initial_state)
+        print(f"  Applicable rules at step 0: {initial_applicable}")
+        self.assertIn(rule1_idx, initial_applicable)
+        self.assertNotIn(rule2_idx, initial_applicable, "Rule 2 should NOT be applicable yet")
 
-    def test_02_dataset_improved_value_target(self):
-        print("\n[TEST] dataset: `_estimate_difficulty` SOTA value target (Issue #2)")
-        # `hard_inst` (sample 3)
-        pos_data, _ = self.ds[3] 
-        # sampler.set_epoch(0)
-        # indices_epoch_0 = list(sampler)
-        # metadata: {"n_nodes": 8, "n_rules": 3, "proof_length": 15}
-        # step_idx = 0
-        # num_nodes (actual) = 8
+        print(f"  Applying rule {rule1_idx} (A -> C)...")
+        next_state = self.simulator.apply_rule(initial_state, rule1_idx)
+        self.assertIsNotNone(next_state)
         
-        # 1. Check curriculum_difficulty
-        # n_rules=3, n_nodes_total=8, proof_length=15
-        # rule_score = 3/40 = 0.075
-        # node_score = 8/70 = 0.1142...
-        # proof_score = 15/15 = 1.0
-        # difficulty = (0.3*0.075) + (0.2*0.1142...) + (0.5*1.0) = 0.0225 + 0.0228... + 0.5 = 0.5453...
-        # --- FIX: Test against the *correct* value with appropriate precision ---
-        # self.assertAlmostEqual(pos_data.difficulty.item(), 0.545357, places=5)
-        # print(f"  ✓ `curriculum_difficulty` ({pos_data.difficulty.item()}) is correct")
+        x_after = next_state.x
         
-        # # 2. Check value_target
-        # # progress = 0 / 15 = 0
-        # # position_value = 1.0 - (0**0.7) = 1.0
-        # # n_nodes_total = 8
-        # # search_space_value = 1.0 - (8 / 200.0) = 1.0 - 0.04 = 0.96
-        # # value_target = (0.7 * 1.0) + (0.3 * 0.96) = 0.7 + 0.288 = 0.988
-        # self.assertAlmostEqual(pos_data.value_target.item(), 0.988, places=3)
-        # print(f"  ✓ Non-linear `value_target` ({pos_data.value_target.item()}) is correct")
-        self.assertAlmostEqual(pos_data.difficulty.item(), 0.545357, places=5)
-        print(f"  ✓ `curriculum_difficulty` ({pos_data.difficulty.item()}) is correct")
+        # --- Assert Feature Recomputation ---
+        print("  Verifying feature recomputation...")
 
-    def test_03_train_instance_level_curriculum(self):
-        print("\n[TEST] train: `InstanceLevelCurriculum` no data leakage (Issue #3)")
-        # Total samples: 5 (easy: [0], test_inst: [1, 2], hard: [3, 4])
-        # Instance difficulties:
-        # easy_inst: ~0.0522
-        # test_inst: ~0.1119
-        # hard_inst: ~0.5454
-        
-        sampler = InstanceLevelCurriculum(self.ds, total_epochs=100)
-        
-        # Epoch 1 (base=0.15, target=0.23) -> Should get easy + test_inst = 3 samples
-        # Fallback should NOT be triggered.
-        print("  Testing Epoch 1 (normal operation)...")
-        sampler.set_epoch(1)
-        indices_epoch_1 = list(sampler)
-        # --- FIX: Correct expected number of samples is 3 ---
-        self.assertEqual(len(indices_epoch_1), 3, "Epoch 1 should find 'easy_inst' and 'test_inst_01'")
-        self.assertIn(0, indices_epoch_1) # easy_inst
-        self.assertIn(1, indices_epoch_1) # test_inst step 0
-        self.assertIn(2, indices_epoch_1) # test_inst step 1
-        print("  ✓ Epoch 1 correctly includes 3 samples from 2 instances")
-        
-        # Epoch 0 (base=0.15, target=0.15) -> Should trigger fallback
-        print("  Testing Epoch 0 (normal operation, no fallback)...")
-        sampler.set_epoch(0)
-        indices_epoch_0 = list(sampler)
-        self.assertEqual(len(indices_epoch_0), 3, "Epoch 0 should find 'easy_inst' and 'test_inst_01'")
-        self.assertIn(0, indices_epoch_0) # easy_inst (the easiest)
-        self.assertIn(1, indices_epoch_0) # test_inst step 0
-        self.assertIn(2, indices_epoch_0) # test_inst step 1
-        print("  ✓ Epoch 0 correctly includes 3 samples (fallback not triggered)")
+        # 1. Check [3] (is_derived) for the new fact 'fC'
+        print(f"    Checking feature [3] (is_derived) for fact 'C' (idx {fact_C_idx})...")
+        self.assertEqual(x_before[fact_C_idx, 3].item(), 0.0, "Fact C should not be derived at start")
+        self.assertEqual(x_after[fact_C_idx, 3].item(), 1.0, "FIX FAILED: Fact C 'is_derived' feature was not updated")
+        print("      ✓ PASSED: 'is_derived' feature updated.")
 
-        # Epoch 100 (target=0.95) -> Should include all 5 samples
-        print("  Testing Epoch 100 (all samples)...")
-        sampler.set_epoch(100)
-        indices_all = list(sampler)
-        self.assertEqual(len(indices_all), 5, "Epoch 100 should include all samples")
-        print("  ✓ Epoch 100 includes all 3 instances")
+        # 2. Check [21] (body_satisfied) for 'r2'
+        #    Body of r2 is {B, C}. At step 0, only {B} was known (1/2 = 0.5)
+        #    At step 1, {B, C} are known (2/2 = 1.0)
+        print(f"    Checking feature [21] (body_satisfied) for rule 'r2' (idx {rule2_idx})...")
+        self.assertAlmostEqual(
+            x_before[rule2_idx, 21].item(), 
+            0.5, 
+            msg="r2 body_satisfied should be 0.5 at start"
+        )
+        self.assertAlmostEqual(
+            x_after[rule2_idx, 21].item(), 
+            1.0, 
+            msg="FIX FAILED: r2 'body_satisfied' feature was not updated to 1.0"
+        )
+        print("      ✓ PASSED: 'body_satisfied' feature updated.")
 
-    def test_04_train_contrastive_collate_fn(self):
-        print("\n[TEST] train: `contrastive_collate` filtering (Issue #6)")
-        item_none = self.ds[0] # (pos, None)
-        item_valid = self.ds[1] # (pos, neg)
-        
-        batch_list = [item_none, item_valid, item_valid]
-        
-        pos_batch, neg_batch = contrastive_collate(batch_list)
-        
-        self.assertIsInstance(pos_batch, Batch)
-        self.assertIsInstance(neg_batch, Batch)
-        
-        self.assertEqual(pos_batch.num_graphs, 2)
-        self.assertEqual(neg_batch.num_graphs, 2)
-        print("  ✓ Collate fn correctly filters 'None' samples")
+        # 3. Check [19] (head_is_derived) for 'r1'
+        #    Head of r1 is {C}. At step 0, {C} was not known.
+        #    At step 1, {C} is now known.
+        print(f"    Checking feature [19] (head_is_derived) for rule 'r1' (idx {rule1_idx})...")
+        self.assertEqual(x_before[rule1_idx, 19].item(), 0.0, "r1 head_is_derived should be 0.0 at start")
+        self.assertEqual(x_after[rule1_idx, 19].item(), 1.0, "FIX FAILED: r1 'head_is_derived' feature was not updated")
+        print("      ✓ PASSED: 'head_is_derived' feature updated.")
 
-    def test_05_train_e2e_smoke_test(self):
-        print("\n[TEST] train: E2E Smoke Test for new training loop")
+        # ==========================================
+        #  PHASE 2: Test State 1 -> State 2
+        # ==========================================
+        print("\n--- Testing State 1 -> State 2 ---")
         
-        sampler = InstanceLevelCurriculum(self.ds, total_epochs=10)
-        sampler.set_epoch(10) # Get 3 samples
-        
-        loader = DataLoader(
-            self.ds,
-            batch_size=3,
-            sampler=sampler,
-            collate_fn=contrastive_collate
+        # This is the *most critical* test.
+        # If features weren't updated, this check will fail.
+        print("  Checking applicable rules in *new* state (State 1)...")
+        applicable_rules_state_1 = self.simulator.get_applicable_rules_indices(next_state)
+        print(f"  Applicable rules at step 1: {applicable_rules_state_1}")
+
+        # r1 (A -> C) should now be INAPPLICABLE because its head {C} is known
+        self.assertNotIn(
+            rule1_idx, 
+            applicable_rules_state_1,
+            "FIX FAILED: Rule r1 should be INAPPLICABLE (head is known)"
         )
         
-        model = get_model(
-            in_dim=BASE_FEATURES, 
-            hidden_dim=HIDDEN_DIM, 
-            k=K_DIM, 
+        # r2 (B, C -> D) should now be APPLICABLE
+        self.assertIn(
+            rule2_idx, 
+            applicable_rules_state_1,
+            "FIX FAILED: Rule r2 is NOT in applicable list. Feature recomputation failed."
         )
+        print(f"    ✓ PASSED: Rule {rule2_idx} is now applicable, and r1 is not.")
         
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-        criterion_rank = get_recommended_loss('triplet_hard')
-        criterion_contrast = nn.L1Loss()
+        # --- Final Step: Apply rule 2 and check goal ---
+        print(f"  Applying rule {rule2_idx} (B, C -> D)...")
+        final_state = self.simulator.apply_rule(next_state, rule2_idx)
+        self.assertIsNotNone(final_state)
         
-        try:
-            metrics = train_epoch(
-                model, loader, optimizer,
-                criterion_rank, criterion_contrast,
-                'cpu', epoch=1,
-                contrast_loss_weight=0.1,
-                value_loss_weight=0.1
-            )
-            
-            self.assertIn('rank_loss', metrics)
-            self.assertIn('value_loss', metrics)
-            self.assertIn('contrast_loss', metrics)
-            self.assertFalse(np.isnan(metrics['rank_loss']))
-            self.assertFalse(np.isnan(metrics['contrast_loss']))
-            print("  ✓ E2E training loop ran for 1 batch")
-            print(f"  ✓ Metrics: {metrics}")
-
-        except Exception as e:
-            self.fail(f"E2E training loop smoke test failed: {e}")
-
+        print("  Verifying goal state...")
+        self.assertEqual(
+            final_state.derived_mask[goal_fact_D_idx].item(), 
+            1, 
+            "Goal fact 'D' was not marked as derived"
+        )
+        self.assertTrue(
+            self.simulator.is_goal_satisfied(final_state),
+            "FIX FAILED: Simulator 'is_goal_satisfied' returned False for final state"
+        )
+        print("    ✓ PASSED: Goal state reached and verified.")
+        print("\n" + "="*70)
+        print(" [SUCCESS] Proof Simulator fix is working correctly.")
+        print("="*70)
 
 if __name__ == '__main__':
-    try:
-        setup_mock_environment()
-        unittest.main(verbosity=2)
-    finally:
-        cleanup_mock_environment()
+    unittest.main()

@@ -81,27 +81,38 @@ class SpectralFeatureExtractor:
         
         return laplacian.tocsr()
     
-    def _eigenvalue_correction(self, eigvals: np.ndarray, epsilon: float = 0.01) -> np.ndarray:
+    def _eigenvalue_correction(self, eigvals: np.ndarray, epsilon: float = 1e-2) -> np.ndarray:
         """
-        FIXED (Issue #1): Spread repeated eigenvalues while PRESERVING structural zeros.
-        Uses adaptive Chebyshev-based spacing for better stability.
+        FIXED: Spread repeated eigenvalues while PRESERVING structural zeros.
+        
+        Key insight: Zero eigenvalues encode # of connected components.
+        This is a fundamental graph property that MUST NOT be modified.
+        
+        Args:
+            eigvals: Original eigenvalues
+            epsilon: Perturbation magnitude
+        
+        Returns:
+            Corrected eigenvalues with structural zeros preserved
         """
+
+        # return corrected
         corrected = eigvals.copy()
         zero_mask = np.abs(eigvals) < 1e-5
         
         # Preserve structural zeros (connected components)
         for i in range(1, len(eigvals)):
-            # CRITICAL: NEVER modify structural zeros
             if zero_mask[i] or zero_mask[i-1]:
                 continue
             
             # ADAPTIVE spacing based on spectral gap
-            if corrected[i] - corrected[i-1] < epsilon:
+            if abs(corrected[i] - corrected[i-1]) < epsilon:
                 # Use Chebyshev nodes spacing for better polynomial interpolation
                 spacing = epsilon * (1 + 0.5 * np.cos(np.pi * i / len(eigvals)))
                 corrected[i] = corrected[i-1] + spacing
         
         return corrected
+    
     def compute_spectral_decomposition(
         self,
         laplacian: sp.csr_matrix,
@@ -265,7 +276,7 @@ def precompute_spectral_cache(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    json_files = list(data_path.glob("**/*.json"))    
+    json_files = list(data_path.glob("*.json"))
     if max_graphs is not None:
         json_files = json_files[:max_graphs]
     
@@ -297,7 +308,7 @@ def precompute_spectral_cache(
                 graph_data = json.load(f)
             
             edges = graph_data.get('edges', [])
-            num_nodes = len(graph_data.get('nodes', []))
+            num_nodes = graph_data.get('num_nodes', 0)
             
             if len(edges) == 0 or num_nodes == 0:
                 logger.warning(f"Empty graph: {instance_id}")
@@ -308,27 +319,12 @@ def precompute_spectral_cache(
             if isinstance(edges[0], dict):
                 edge_list = []
                 for edge in edges:
-                    # FIX: Ensure src/dst are valid node IDs
-                    if edge.get('src') is not None and edge.get('dst') is not None:
-                        edge_list.append([edge['src'], edge['dst']])
+                    edge_list.append([edge['src'], edge['dst']])
             else:
                 edge_list = edges
             
-            nodes = graph_data.get('nodes', [])
-            nid_to_idx = {n["nid"]: i for i, n in enumerate(nodes)}
+            edge_index = torch.tensor(edge_list, dtype=torch.long).t()
             
-            edge_index_mapped = []
-            for u, v in edge_list:
-                src_idx = nid_to_idx.get(u)
-                dst_idx = nid_to_idx.get(v)
-                if src_idx is not None and dst_idx is not None:
-                    edge_index_mapped.append([src_idx, dst_idx])
-            
-            if not edge_index_mapped:
-                 edge_index = torch.empty((2, 0), dtype=torch.long)
-            else:
-                 edge_index = torch.tensor(edge_index_mapped, dtype=torch.long).t()
-
             start_time = time.time()
             
             features = extractor.extract_features(
@@ -354,6 +350,7 @@ def precompute_spectral_cache(
             logger.error(f"Failed to process {instance_id}: {e}")
             stats['failed'] += 1
     
+    # Compute summary statistics
     if stats['avg_eigenvalues']:
         stats['eigenvalue_statistics'] = {
             'mean': np.mean([ev.mean() for ev in stats['avg_eigenvalues']]),
@@ -371,7 +368,7 @@ def precompute_spectral_cache(
         stats_serializable = {
             k: (v.tolist() if isinstance(v, np.ndarray) else v)
             for k, v in stats.items()
-            if k != 'avg_eigenvalues' and k != 'avg_time_per_graph'
+            if k != 'avg_eigenvalues'
         }
         json.dump(stats_serializable, f, indent=2)
     

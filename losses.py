@@ -359,31 +359,6 @@ class TripletLossWithHardMining(nn.Module):
         loss = F.relu(self.margin - (positive_score - hardest_negative_score))
 
         return loss
-def contrastive_loss(pos_score: torch.Tensor, neg_scores: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
-    """
-    Computes the InfoNCE contrastive loss.
-    
-    Args:
-        pos_score: [B] - scores for the B correct rules
-        neg_scores: [B, K] - scores for K negative rules per positive
-        temperature: Scaling factor
-    
-    Returns:
-        Loss (scalar tensor)
-    """
-    # Ensure pos_score is [B, 1]
-    if pos_score.dim() == 1:
-        pos_score = pos_score.unsqueeze(-1)
-        
-    # Concatenate: [B, 1+K]
-    logits = torch.cat([pos_score, neg_scores], dim=1)
-    logits = logits / temperature
-    
-    # Labels are always 0 (the positive sample)
-    labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
-    
-    return F.cross_entropy(logits, labels)
-# [ --- END NEW --- ]
 
 def get_recommended_loss(loss_type='triplet_hard', margin=1.0): # Add margin arg
     """Returns the recommended loss function."""
@@ -393,9 +368,6 @@ def get_recommended_loss(loss_type='triplet_hard', margin=1.0): # Add margin arg
     elif loss_type == 'cross_entropy':
         print("Using Loss: MaskedCrossEntropyLoss")
         return MaskedCrossEntropyLoss()
-    elif loss_type =='contrastive_loss':
-        print("Using Loss: Contrastive Loss")
-        return contrastive_loss()
     elif loss_type == 'triplet_hard':
         print(f"Using Loss: TripletLossWithHardMining (margin={margin})")
         return TripletLossWithHardMining(margin=margin)

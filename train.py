@@ -8,11 +8,11 @@ Key Fixes:
 4. Proper batch size recommendations
 """
 
+from collections import defaultdict
 import os
 import json
 from pathlib import Path
 from typing import List
-import numpy as np
 
 import torch
 import torch.nn as nn
@@ -21,9 +21,10 @@ from torch.optim import AdamW
 from torch.utils.data.dataloader import logger
 from torch_geometric.loader import DataLoader
 from torch.utils.data import SubsetRandomSampler, Sampler
-from collections import defaultdict
-from dataset import ContrastiveProofDataset, StepPredictionDataset, create_split
-from losses import MaskedCrossEntropyLoss, compute_hit_at_k, compute_mrr, TripletLossWithHardMining, get_recommended_loss
+import numpy as np
+
+from dataset import StepPredictionDataset, create_split
+from losses import compute_hit_at_k, compute_mrr, TripletLossWithHardMining
 import sys
 sys.path.insert(0, '.')
 from model import get_model, FixedTemporalSpectralGNN
@@ -32,50 +33,71 @@ import re
 from losses import ApplicabilityConstrainedLoss, compute_mrr
 
 
-"""
-FIXED Training Script
-
-Key Fixes:
-1.  FIXED (Issue #3): Replaced sample-level curriculum with
-    InstanceLevelCurriculum to prevent data leakage.
-2.  FIXED (Issue #6): Updated training/evaluation loops to handle
-    (positive, negative) sample tuples for contrastive learning.
-3.  FIXED (Model Mismatch): Re-enabled TacticGuidedGNN and tactic
-    loss, which were previously ignored.
-4.  FIXED (TypeError): InstanceLevelCurriculum now computes its
-    own simple difficulty from metadata, decoupling it from
-    the dataset's value_target logic.
-"""
-
-import os
-import json
-from pathlib import Path
-import numpy as np
-from collections import defaultdict
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.optim import AdamW
-from torch.utils.data.dataloader import logger
-from torch_geometric.loader import DataLoader
-from torch.utils.data import SubsetRandomSampler, Sampler
-
-# --- MODIFIED: Import full dataset class for type hinting ---
-from dataset import StepPredictionDataset, create_split
-from losses import compute_hit_at_k, compute_mrr
-import sys
-sys.path.insert(0, '.')
-from model import get_model, TacticGuidedGNN
-from losses import get_recommended_loss
-
-
 def get_lr(optimizer):
     """Get current learning rate."""
     for param_group in optimizer.param_groups:
         return param_group['lr']
 
-# --- START FIX (Issue #3 & TypeError): Instance-Level Curriculum ---
+class CurriculumScheduler:
+    """
+    Progressive difficulty scheduling (from Phase 1).
+    Adapted for Phase 2 dataloader.
+    """
+    def __init__(self, dataset: StepPredictionDataset, 
+                 base_difficulty: float = 0.15, 
+                 max_difficulty: float = 0.95):
+        self.dataset = dataset
+        self.base_difficulty = base_difficulty
+        self.max_difficulty = max_difficulty
+        
+        # Pre-calculate difficulties
+        print("Initializing CurriculumScheduler (reading from dataset)...")
+        
+        # New CORRECT way: Use the dataset's own difficulty computation
+        self.difficulties = []
+        if len(dataset) == 0:
+            print("Warning: CurriculumScheduler found no samples.")
+            
+        # This is slow, but only runs once at startup.
+        # It loads each Data object to access the .difficulty attribute
+        # which was correctly computed by _estimate_difficulty in dataset.py
+        for i in range(len(dataset)):
+            try:
+                self.difficulties.append(dataset[i].difficulty.item())
+            except Exception as e:
+                # This might fail if a file is corrupt, good to have a fallback
+                print(f"Warning: Could not load sample {i} for difficulty. Skipping. Error: {e}")
+                continue # Skip this sample
+        
+        if not self.difficulties:
+             print("CRITICAL WARNING: CurriculumScheduler failed to load any difficulties.")
+        
+        print(f"Difficulty scores read for {len(self.difficulties)} samples.")
+
+    def get_batch_indices(self, epoch: int, total_epochs: int) -> list[int]:
+        """Return indices for current difficulty level."""
+        # Linear progression from base to max
+        progress = epoch / max(total_epochs, 1) ** 0.5
+        target_difficulty = (self.base_difficulty + 
+                            (self.max_difficulty - self.base_difficulty) * progress)
+        
+        # Select instance indices below the target difficulty
+        valid_indices = [
+            i for i, diff in enumerate(self.difficulties)
+            if diff <= target_difficulty
+        ]
+        
+        if not valid_indices:
+            # Fallback: take N easiest samples
+            sorted_indices = sorted(enumerate(self.difficulties), key=lambda x: x[1])
+            valid_indices = [i for i, _ in sorted_indices[:max(1, len(self.difficulties) // 10)]]
+            logger.warning(f"Curriculum fallback: using {len(valid_indices)} easiest samples")
+        
+        print(f"  [Curriculum] Epoch {epoch}: Target difficulty <= {target_difficulty:.3f}, "
+              f"found {len(valid_indices)}/{len(self.difficulties)} samples.")
+        return valid_indices
+
+
 class InstanceLevelCurriculum(Sampler):
     """
     FIXED: Implements instance-level curriculum scheduling to prevent
@@ -96,33 +118,28 @@ class InstanceLevelCurriculum(Sampler):
         
         print("Initializing InstanceLevelCurriculum (grouping samples)...")
         
+        # 1. Group sample indices by instance_id
         self.instance_to_indices = defaultdict(list)
+        # 2. Store difficulty for each instance
         self.instance_difficulties = {}
         
+        # This is slow, but only runs once.
         for i, sample_tuple in enumerate(dataset.samples):
             inst, step_idx, _, metadata = sample_tuple
             inst_id = inst.get("id", f"unknown_{i}")
             
             self.instance_to_indices[inst_id].append(i)
             
-            # --- START FIX: Compute simple difficulty from metadata ---
+            # Use difficulty from metadata
+            difficulty = dataset._estimate_difficulty(metadata)
+            
+            # Store the MAX difficulty found for this instance
             if inst_id not in self.instance_difficulties:
-                # This logic is now self-contained and only uses metadata
-                n_rules = metadata.get('n_rules', 10)
-                n_nodes_total = metadata.get('n_nodes', 20)
-                proof_length = metadata.get('proof_length', 1)
-                if proof_length == 0: proof_length = 1 # Avoid division by zero
-                
-                rule_score = min(n_rules / 40.0, 1.0)
-                node_score = min(n_nodes_total / 70.0, 1.0)
-                proof_score = min(proof_length / 15.0, 1.0)
-                
-                curriculum_difficulty = (0.3 * rule_score + 
-                                         0.2 * node_score + 
-                                         0.5 * proof_score)
-                
-                self.instance_difficulties[inst_id] = min(max(curriculum_difficulty, 0.0), 1.0)
-            # --- END FIX ---
+                self.instance_difficulties[inst_id] = difficulty
+            else:
+                self.instance_difficulties[inst_id] = max(
+                    self.instance_difficulties[inst_id], difficulty
+                )
 
         self.instance_ids = list(self.instance_difficulties.keys())
         print(f"Cached difficulties for {len(self.instance_ids)} instances.")
@@ -132,6 +149,7 @@ class InstanceLevelCurriculum(Sampler):
 
     def _get_indices_for_epoch(self, epoch: int) -> List[int]:
         """Calculates the valid sample indices for a given epoch."""
+        # Non-linear progression (e.g., sqrt)
         progress = (epoch / max(self.total_epochs, 1)) ** 0.5
         target_difficulty = (self.base_difficulty + 
                             (self.max_difficulty - self.base_difficulty) * progress)
@@ -143,7 +161,7 @@ class InstanceLevelCurriculum(Sampler):
                 valid_sample_indices.extend(self.instance_to_indices[inst_id])
                 instances_included += 1
         
-        if not valid_sample_indices and len(self.instance_ids) > 0:
+        if not valid_sample_indices:
             # Fallback: take easiest 5% of instances
             print("  [Curriculum Warning] Fallback: No instances matched. Taking 5% easiest.")
             sorted_instances = sorted(self.instance_difficulties.items(), key=lambda x: x[1])
@@ -164,239 +182,218 @@ class InstanceLevelCurriculum(Sampler):
         
     def __iter__(self):
         if self.current_epoch == -1:
+            # Set epoch 0 if not explicitly set
             self.set_epoch(0)
+            
+        # Shuffle and return the indices for the current epoch
         np.random.shuffle(self.current_indices)
         return iter(self.current_indices)
 
     def __len__(self):
         return len(self.current_indices)
 
-
-# --- START FIX (Issue #6 & Model Mismatch): Updated Training Loop ---
-def train_epoch(model, loader, optimizer, criterion_rank, criterion_contrast,
-                device, epoch, grad_accum_steps=1, 
-                value_loss_weight=0.1,
-                contrast_loss_weight=0.3):
-    """
-    FIXED: Training loop for TacticGuidedGNN with contrastive loss.
-    Handles (pos_data, neg_data) tuples.
-    """
+        
+def train_epoch(model, loader, optimizer, criterion, device, epoch,
+                grad_accum_steps=1, value_loss_weight=0.1): # <-- Removed tactic_loss_weight
+    """Fixed training loop for the base GNN (no tactic loss)."""
     model.train()
-    
+
     total_rank_loss = 0
     total_value_loss = 0
-    total_contrast_loss = 0
+    # total_tactic_loss = 0  <-- REMOVED
     correct_preds = 0
-    n_samples = 0
-    num_batches_processed = 0
+    n_samples = 0 # Counter for number of GRAPHS processed
 
     optimizer.zero_grad()
-    
+
+    # Use tqdm for progress bar
     from tqdm import tqdm
     progress_bar = tqdm(loader, desc=f"Epoch {epoch} Training", leave=False)
 
-    for batch_idx, batch_tuple in enumerate(progress_bar):
-        
-        pos_batch, neg_batch = batch_tuple
-        if pos_batch is None or neg_batch is None:
-            continue
-            
-        pos_batch = pos_batch.to(device)
-        neg_batch = neg_batch.to(device)
+    for batch_idx, batch in enumerate(progress_bar): # NEW: Use tqdm
+        batch = batch.to(device)
 
-        scores, pos_embeddings, value = model(
-            pos_batch.x, pos_batch.edge_index, pos_batch.derived_mask,
-            pos_batch.step_numbers, pos_batch.eigvecs, pos_batch.eigvals,
-            pos_batch.eig_mask, pos_batch.edge_attr, pos_batch.batch
+        # --- MODIFIED: Model now returns 3 outputs ---
+        scores, embeddings, value = model(
+            batch.x, batch.edge_index, batch.derived_mask,
+            batch.step_numbers, batch.eigvecs, batch.eigvals,
+            batch.eig_mask, batch.edge_attr, batch.batch
         )
 
-        _, neg_embeddings, _ = model(
-            neg_batch.x, neg_batch.edge_index, neg_batch.derived_mask,
-            neg_batch.step_numbers, neg_batch.eigvecs, neg_batch.eigvals,
-            neg_batch.eig_mask, neg_batch.edge_attr, neg_batch.batch
-        )
-        
-        batch_size = pos_batch.num_graphs
+        batch_size = batch.num_graphs # Number of graphs in this batch
 
-        batch_rank_loss = 0
-        batch_value_loss = 0
-        batch_contrast_loss = 0
-        graphs_in_batch_processed = 0
+        # --- REMOVED: Tactic Loss calculation block ---
 
+        batch_rank_val_loss = 0 # Accumulator for ranking + value loss for graphs in this batch
+        batch_value_loss_item = 0 # Accumulator for value loss item value for logging
+        batch_rank_loss_item = 0  # Accumulator for rank loss item value for logging
+        graphs_in_batch_processed = 0 # Count graphs successfully processed in this batch
+
+        # --- Loop through graphs for Ranking and Value loss ---
         for i in range(batch_size):
-            pos_mask = (pos_batch.batch == i)
-            neg_mask = (neg_batch.batch == i)
+            mask = (batch.batch == i)
+            graph_scores = scores[mask]
             
-            graph_scores = scores[pos_mask]
             if graph_scores.numel() == 0:
                 continue
 
-            graph_pos_embeds = pos_embeddings[pos_mask]
-            target_idx = pos_batch.y[i].item()
-            graph_applicable = pos_batch.applicable_mask[pos_mask]
-            
+            graph_embeddings = embeddings[mask]
+            target_idx = batch.y[i].item()
+
+            graph_applicable = batch.applicable_mask[mask] if hasattr(batch, 'applicable_mask') else None
+
             if target_idx < 0 or target_idx >= len(graph_scores):
                 continue
-            
-            rank_loss = criterion_rank(
+
+            # Calculate Ranking loss for this graph
+            rank_loss = criterion(
                 graph_scores,
-                graph_pos_embeds,
+                graph_embeddings,
                 target_idx,
                 applicable_mask=graph_applicable
             )
-            if torch.isnan(rank_loss) or torch.isinf(rank_loss):
-                continue
 
-            graph_value = value[i].unsqueeze(0)
-            target_value = pos_batch.value_target[i].unsqueeze(0)
+            # Calculate Value loss for this graph
+            graph_value = value[i].unsqueeze(0) # Make it [1]
+            target_value = batch.value_target[i].unsqueeze(0) # Make it [1]
             val_loss = F.mse_loss(graph_value, target_value)
-            
-            pos_target_embed = graph_pos_embeds[target_idx]
-            
-            neg_target_idx = neg_batch.y[i].item()
-            graph_neg_embeds = neg_embeddings[neg_mask]
-            
-            if neg_target_idx < 0 or neg_target_idx >= len(graph_neg_embeds):
-                continue
-                
-            neg_target_embed = graph_neg_embeds[neg_target_idx]
-            
-            con_loss = criterion_contrast(
-                pos_target_embed.unsqueeze(0),
-                neg_target_embed.unsqueeze(0)
-            )
-            
-            batch_rank_loss += rank_loss
-            batch_value_loss += val_loss
-            batch_contrast_loss += con_loss
-            graphs_in_batch_processed += 1
-            
-            if graph_scores.argmax().item() == target_idx:
-                correct_preds += 1
 
+            # Accumulate per-graph RANKING + VALUE losses
+            if not (torch.isnan(rank_loss) or torch.isinf(rank_loss)):
+                # --- MODIFIED: Removed tactic loss from combination ---
+                graph_rank_val_loss = (
+                    rank_loss +
+                    value_loss_weight * val_loss
+                )
+                batch_rank_val_loss += graph_rank_val_loss 
+                batch_value_loss_item += val_loss.item() 
+                batch_rank_loss_item += rank_loss.item() 
+                graphs_in_batch_processed += 1 
+
+                if graph_scores.argmax().item() == target_idx:
+                    correct_preds += 1
+
+        # --- Calculate final batch loss (Avg Rank+Val) and backpropagate ---
         if graphs_in_batch_processed > 0:
-            avg_rank_loss = batch_rank_loss / graphs_in_batch_processed
-            avg_value_loss = batch_value_loss / graphs_in_batch_processed
-            avg_contrast_loss = batch_contrast_loss / graphs_in_batch_processed
+            avg_rank_val_loss_for_batch = batch_rank_val_loss / graphs_in_batch_processed
             
-            combined_batch_loss = (
-                avg_rank_loss +
-                value_loss_weight * avg_value_loss +
-                contrast_loss_weight * avg_contrast_loss
-            )
+            # --- MODIFIED: Combined loss no longer includes tactic loss ---
+            combined_batch_loss = avg_rank_val_loss_for_batch
 
+            # Scale loss for gradient accumulation
             final_batch_loss = combined_batch_loss / grad_accum_steps
-            final_batch_loss.backward()
+            final_batch_loss.backward() 
 
-            total_rank_loss += avg_rank_loss.item()
-            total_value_loss += avg_value_loss.item()
-            total_contrast_loss += avg_contrast_loss.item()
-            n_samples += graphs_in_batch_processed
-            num_batches_processed += 1
+            # Accumulate total losses for epoch logging (use item values)
+            total_rank_loss += (batch_rank_loss_item / graphs_in_batch_processed) 
+            total_value_loss += (batch_value_loss_item / graphs_in_batch_processed)
+            # total_tactic_loss += 0 <-- REMOVED
 
+            n_samples += graphs_in_batch_processed 
+
+            # --- Gradient accumulation step ---
             if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1 == len(loader)):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) 
                 optimizer.step()
                 optimizer.zero_grad()
 
+        # --- MODIFIED: Update tqdm progress bar (removed TacL) ---
         progress_bar.set_postfix({
-             'RankL': f'{total_rank_loss / max(1, num_batches_processed):.3f}',
-             'ValL': f'{total_value_loss / max(1, num_batches_processed):.3f}',
-             'ConL': f'{total_contrast_loss / max(1, num_batches_processed):.3f}'
+             'RankL': f'{total_rank_loss / max(batch_idx + 1, 1):.4f}',
+             'ValL': f'{total_value_loss / max(batch_idx + 1, 1):.4f}'
         })
 
     progress_bar.close() 
 
-    num_batches_processed = max(1, num_batches_processed)
+    # --- Calculate epoch averages ---
+    num_batches_processed = batch_idx + 1
     accuracy = correct_preds / max(n_samples, 1)
+    avg_loss = total_rank_loss / max(num_batches_processed, 1)
+    avg_value_loss = total_value_loss / max(num_batches_processed, 1)
+    # avg_tactic_loss = 0 <-- REMOVED
+
+    # --- MODIFIED: Return signature ---
+    return avg_loss, avg_value_loss, accuracy
     
-    return {
-        "rank_loss": total_rank_loss / num_batches_processed,
-        "value_loss": total_value_loss / num_batches_processed,
-        "contrast_loss": total_contrast_loss / num_batches_processed,
-        "accuracy": accuracy
-    }
-    
+
 @torch.no_grad()
-def evaluate(model, loader, criterion_rank, device, split='val'):
-    """
-    FIXED: Evaluation loop for TacticGuidedGNN.
-    Handles (pos, neg) tuples but only evaluates on pos_batch.
-    """
+def evaluate(model, loader, criterion, device, split='val'):
+    """Fixed evaluation for the base GNN (no tactic loss)."""
     model.eval()
     
-    rank_losses, value_losses = [], []
-    hit1, hit3, hit10, ranks = [], [], [], []
+    losses = []
+    hit1, hit3, hit5, hit10 = [], [], [], []
+    ranks = []
     value_loss_fn = nn.MSELoss()
+    value_losses = []
+    # --- REMOVED: Tactic loss components ---
+    # tactic_loss_fn = nn.CrossEntropyLoss()
+    # tactic_losses = []
 
-    for batch_tuple in loader:
-        pos_batch, _ = batch_tuple
-        if pos_batch is None:
-            continue
-            
-        pos_batch = pos_batch.to(device)
+    for batch in loader:
+        batch = batch.to(device)
         
+        # --- MODIFIED: Model now returns 3 outputs ---
         scores, embeddings, value = model(
-            pos_batch.x, pos_batch.edge_index, pos_batch.derived_mask,
-            pos_batch.step_numbers, pos_batch.eigvecs, pos_batch.eigvals,
-            pos_batch.eig_mask, pos_batch.edge_attr, pos_batch.batch
+            batch.x, batch.edge_index, batch.derived_mask,
+            batch.step_numbers, batch.eigvecs, batch.eigvals,
+            batch.eig_mask, batch.edge_attr, batch.batch
         )
-        batch_size = pos_batch.num_graphs
+        batch_size = batch.num_graphs
         
+        # --- REMOVED: Tactic loss calculation ---
 
         for i in range(batch_size):
-            mask = (pos_batch.batch == i)
+            mask = (batch.batch == i)
             graph_scores = scores[mask]
-            
-            if graph_scores.numel() == 0: continue
-
             graph_embeddings = embeddings[mask]
-            target_idx = pos_batch.y[i].item()
-            graph_applicable = pos_batch.applicable_mask[mask]
+            target_idx = batch.y[i].item()
+            
+            if hasattr(batch, 'applicable_mask'):
+                graph_applicable = batch.applicable_mask[mask]
+            else:
+                graph_applicable = None
             
             if target_idx < 0 or target_idx >= len(graph_scores):
                 continue
             
-            loss = criterion_rank(
+            loss = criterion(
                 graph_scores, 
                 graph_embeddings, 
                 target_idx,
                 applicable_mask=graph_applicable
             )
-            if not (torch.isnan(loss) or torch.isinf(loss)):
-                rank_losses.append(loss.item())
+            losses.append(loss.item())
 
-            val_loss = value_loss_fn(value[i], pos_batch.value_target[i])
+            val_loss = value_loss_fn(value[i], batch.value_target[i])
             value_losses.append(val_loss.item())
             
-            hit1.append(compute_hit_at_k(graph_scores, target_idx, 1, graph_applicable))
-            hit3.append(compute_hit_at_k(graph_scores, target_idx, 3, graph_applicable))
-            hit10.append(compute_hit_at_k(graph_scores, target_idx, 10, graph_applicable))
-            ranks.append(compute_mrr(graph_scores, target_idx, graph_applicable))
-    
-    def _safe_mean(l): return sum(l) / max(len(l), 1)
-
-    return {
-        f'{split}_rank_loss': _safe_mean(rank_losses),
-        f'{split}_value_loss': _safe_mean(value_losses),
-        f'{split}_hit1': _safe_mean(hit1),
-        f'{split}_hit3': _safe_mean(hit3),
-        f'{split}_hit10': _safe_mean(hit10),
-        f'{split}_mrr': _safe_mean(ranks),
-    }
-
-def contrastive_collate(batch_list):
-        from torch_geometric.data import Batch
-        
-        pos_list = [item[0] for item in batch_list if item[0] is not None and item[1] is not None]
-        neg_list = [item[1] for item in batch_list if item[0] is not None and item[1] is not None]
-        
-        if not pos_list or not neg_list:
-            return None, None
+            hit1.append(compute_hit_at_k(graph_scores, target_idx, 1, 
+                                        applicable_mask=graph_applicable))
+            hit3.append(compute_hit_at_k(graph_scores, target_idx, 3,
+                                        applicable_mask=graph_applicable))
+            hit5.append(compute_hit_at_k(graph_scores, target_idx, 5,
+                                        applicable_mask=graph_applicable))
+            hit10.append(compute_hit_at_k(graph_scores, target_idx, 10,
+                                         applicable_mask=graph_applicable))
             
-        pos_batch = Batch.from_data_list(pos_list)
-        neg_batch = Batch.from_data_list(neg_list)
-        return pos_batch, neg_batch
+            ranks.append(compute_mrr(graph_scores, target_idx, 
+                                    applicable_mask=graph_applicable))
+    
+    mrr = sum(ranks) / max(len(ranks), 1)
+    
+    # --- MODIFIED: Return dictionary (removed tactic_loss) ---
+    return {
+        f'{split}_loss': sum(losses) / max(len(losses), 1),
+        f'{split}_value_loss': sum(value_losses) / max(len(value_losses), 1),
+        # f'{split}_tactic_loss': 0, <-- REMOVED
+        f'{split}_hit1': sum(hit1) / max(len(hit1), 1),
+        f'{split}_hit3': sum(hit3) / max(len(hit3), 1),
+        f'{split}_hit5': sum(hit5) / max(len(hit5), 1),
+        f'{split}_hit10': sum(hit10) / max(len(hit10), 1),
+        f'{split}_mrr': mrr,
+        f'{split}_n': len(hit1)
+    }
 
 def main():
     import argparse
@@ -405,30 +402,53 @@ def main():
     parser.add_argument('--data-dir', required=True)
     parser.add_argument('--exp-dir', default='experiments/fixed_run')
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=5e-4)
+    
+    # FIXED: Recommended batch size (was 16)
+    parser.add_argument('--batch-size', type=int, default=32,
+                       help='Batch size (effective batch = batch_size * grad_accum_steps)')
+    
+    # FIXED: Recommended learning rate
+    parser.add_argument('--lr', type=float, default=5e-4,
+                       help='Peak learning rate')
+    
+    # FIXED: Model architecture
     parser.add_argument('--hidden-dim', type=int, default=256)
     parser.add_argument('--num-layers', type=int, default=4)
     parser.add_argument('--dropout', type=float, default=0.3)
     
-    parser.add_argument('--loss-type', type=str, default='triplet_hard',
-                       choices=['triplet_hard', 'cross_entropy', 'applicability_constrained'])
-    parser.add_argument('--margin', type=float, default=1.0)
-    parser.add_argument('--contrast-loss-weight', type=float, default=0.3,
-                       help='Weight for the contrastive loss')
-                       
-    parser.add_argument('--grad-accum-steps', type=int, default=2)
-    parser.add_argument('--grad-clip', type=float, default=1.0)
+    # Loss function
+    parser.add_argument('--margin', type=float, default=0.5)
+    parser.add_argument('--hard-neg-weight', type=float, default=2.0)
+    parser.add_argument('--loss-type', type=str, default='applicability_constrained',
+                       choices=['triplet_hard', 'cross_entropy', 'applicability_constrained'],
+                       help='Type of ranking loss function to use.')
+    # parser.add_argument('--margin', type=float, default=1.0,
+    #                    help='Margin for margin-based losses (Triplet, ApplicabilityConstrained).')
+    
+    # FIXED: Recommended grad accumulation
+    parser.add_argument('--grad-accum-steps', type=int, default=2,
+                       help='Gradient accumulation steps (effective batch = 32*2 = 64)')
+    
+    # FIXED: Gradient clipping
+    parser.add_argument('--grad-clip', type=float, default=1.0,
+                       help='Gradient clipping threshold')
+    
+    parser.add_argument('--use-type-aware', action='store_true', default=True)
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--spectral-dir', type=str, default=None)
-    parser.add_argument('--value-loss-weight', type=float, default=0.1)
-    parser.add_argument('--k-dim', type=int, default=16)
+    parser.add_argument('--spectral-dir', type=str, default=None,
+                       help='Directory containing precomputed spectral features')
+    parser.add_argument('--value-loss-weight', type=float, default=0.1,
+                       help='Weight for the value prediction loss')
+    parser.add_argument('--tactic-loss-weight', type=float, default=0.1,
+                       help='Weight for the tactic prediction loss')
+
+    parser.add_argument('--k-dim', type=int, default=16,
+                   help='Spectral dimension (k) to use. Must match preprocessing.')
     
     args = parser.parse_args()
     
     torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
     
     if args.device == 'cpu':
         device = torch.device('cpu')
@@ -442,132 +462,143 @@ def main():
 
     print(f"\nUsing device: {device}")
     print("="*70)
-    print("SOTA TRAINING - Priority Fixes Implemented")
-    print("="*70)
-    print(f"Loss: {args.loss_type} (Margin: {args.margin})")
-    print(f"Contrastive Loss Weight: {args.contrast_loss_weight}")
-    print(f"Curriculum: Instance-Level (FIXED)")
-    print(f"Model: TacticGuidedGNN (FIXED)")
-    print(f"Params: LR={args.lr}, Hidden={args.hidden_dim}, Layers={args.num_layers}")
     
+    print("\n" + "="*70)
+    print("FIXED TRAINING - All Corrections Applied")
+    print("="*70)
+    # print(f"Loss: MarginRankingLoss (FIXED: 70% hard, 30% easy)")
+    print(f"Loss: {args.loss_type} (Margin: {args.margin if 'triplet' in args.loss_type or 'applicability' in args.loss_type else 'N/A'})") # NEW
+    print(f"Batch Size: {args.batch_size} (Effective: {args.batch_size * args.grad_accum_steps})")# NEW    print(f"Batch Size: {args.batch_size} (Effective: {args.batch_size * args.grad_accum_steps})")
+    print(f"Gradient Accumulation: {args.grad_accum_steps} steps")
+    print(f"Gradient Clipping: {args.grad_clip}")
+    print(f"Model: Fixed Spectral-Temporal GNN")
+    print(f"  - Parallel pathways (spectral, spatial, temporal)")
+    print(f"  - Multi-scale temporal encoding")
+    print(f"  - Late fusion of all pathways")
+    print(f"Params: LR={args.lr}, Hidden={args.hidden_dim}, Layers={args.num_layers}")
+    print(f"Scheduler: ReduceLROnPlateau (factor=0.5, patience=10)")
+    
+    # Load data
     train_files, val_files, test_files = create_split(args.data_dir, seed=args.seed)
     
-    train_ds = StepPredictionDataset(
-        train_files, spectral_dir=args.spectral_dir, 
-        seed=args.seed, k_dim=args.k_dim, 
-        contrastive_neg=True
-    )
-    val_ds = StepPredictionDataset(
-        val_files, spectral_dir=args.spectral_dir, 
-        seed=args.seed+1, k_dim=args.k_dim,
-        contrastive_neg=True
-    )
-    test_ds = StepPredictionDataset(
-        test_files, spectral_dir=args.spectral_dir, 
-        seed=args.seed+2, k_dim=args.k_dim,
-        contrastive_neg=True
-    )
+    train_ds = StepPredictionDataset(train_files, spectral_dir=args.spectral_dir, seed=args.seed, k_dim=args.k_dim)
+    val_ds = StepPredictionDataset(val_files, spectral_dir=args.spectral_dir, seed=args.seed+1, k_dim=args.k_dim)
+    test_ds = StepPredictionDataset(test_files, spectral_dir=args.spectral_dir, seed=args.seed+2, k_dim=args.k_dim)
     
     print(f"\nDataset: Train={len(train_ds)}, Val={len(val_ds)}, Test={len(test_ds)}")
-
-    curriculum_scheduler = InstanceLevelCurriculum(
-        train_ds, total_epochs=args.epochs
-    )
+    num_tactics = train_ds.num_tactics # Get from dataset
+    curriculum_scheduler = CurriculumScheduler(train_ds)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size)
     
- 
-
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, 
-        collate_fn=contrastive_collate, num_workers=2
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=args.batch_size, 
-        collate_fn=contrastive_collate, num_workers=2
-    )
     
-    if len(train_ds) == 0:
-        raise ValueError("Training dataset is empty!")
-    
-    # --- FIX: Handle empty/filtered dataset ---
-    try:
-        first_sample_tuple = next(item for item in train_ds if item[0] is not None)
-        in_dim = first_sample_tuple[0].x.shape[1]
-    except StopIteration:
-        raise ValueError("Dataset contains no valid samples. Check data generation and paths.")
-    
+    # Model
+    # Get in_dim from the first sample, but NOT k_dim
+    in_dim = train_ds[0].x.shape[1]
+    # Use the EXPLICIT k-dim from the command line
     k_dim = args.k_dim 
-    num_tactics = train_ds.num_tactics
-    
-    model = get_model(
+    print(f"Input dimension: {in_dim} (Base) + {k_dim} (Spectral) [FORCED via --k-dim]")
+    model = FixedTemporalSpectralGNN(
         in_dim=in_dim,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
-        k=k_dim,
-        num_tactics=num_tactics
+        k=k_dim
     ).to(device)
     
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {n_params:,} parameters")
     
-    criterion_rank = get_recommended_loss(args.loss_type, args.margin)
-    criterion_contrast = nn.L1Loss() 
+    # Loss (FIXED)
+    if args.loss_type == 'triplet_hard':
+        criterion = TripletLossWithHardMining(margin=args.margin)
+    elif args.loss_type == 'cross_entropy':
+        # Import if needed: from losses import MaskedCrossEntropyLoss
+        from losses import MaskedCrossEntropyLoss
+        criterion = MaskedCrossEntropyLoss()
+    elif args.loss_type == 'applicability_constrained':
+        # Import if needed: from losses import ApplicabilityConstrainedLoss
+        from losses import ApplicabilityConstrainedLoss
+        criterion = ApplicabilityConstrainedLoss(margin=args.margin, penalty_nonapplicable=10.0) # Using lower penalty
+    else: # Should not happen due to choices in argparser
+        raise ValueError(f"Unknown loss type: {args.loss_type}")
+
+    print(f"Using {args.loss_type} for ranking.")
     
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
-    
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=10, min_lr=1e-6
+    # Optimizer
+    optimizer = AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=1e-3,
+        betas=(0.9, 0.98)
     )
     
+    # FIXED: Use ReduceLROnPlateau (simpler, more robust for GNNs)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='max',  # Maximize Hit@1
+        factor=0.5,
+        patience=10,
+        min_lr=1e-6
+    )
+    
+    # Training
     best_val_hit1 = 0
     best_val_mrr = 0
     patience_counter = 0
-    warmup_epochs = 3
-    
+
+    warmup_epochs = 3 # Warm up for 3 epochs
+    peak_lr = args.lr   
+
     print("\nTraining...")
     print("="*70)
     
     for epoch in range(1, args.epochs + 1):
-        curriculum_scheduler.set_epoch(epoch)
-        train_loader = DataLoader(
-            train_ds, 
-            batch_size=args.batch_size, 
-            sampler=curriculum_scheduler,
-            collate_fn=contrastive_collate,
-            num_workers=4,
-            pin_memory=True
-        )
-        
-        if len(train_loader) == 0:
-            print(f"  [Curriculum Warning] Epoch {epoch}: No samples selected. Skipping.")
-            continue
-            
         if epoch <= warmup_epochs:
-            current_lr = args.lr * (epoch / warmup_epochs)
+            # Linearly increase LR from 0 to peak_lr
+            current_lr = peak_lr * (epoch / warmup_epochs)
             for param_group in optimizer.param_groups:
                 param_group['lr'] = current_lr
         else:
+            # After warmup, let the ReduceLROnPlateau scheduler take over
+            # (it will use the last set LR as its starting point)
             current_lr = get_lr(optimizer)
 
-        metrics = train_epoch(
-            model, train_loader, optimizer, 
-            criterion_rank, criterion_contrast,
-            device, epoch, args.grad_accum_steps,
-            args.value_loss_weight, 
-            args.contrast_loss_weight
+        valid_indices = curriculum_scheduler.get_batch_indices(epoch, args.epochs)
+        sampler = SubsetRandomSampler(valid_indices)
+        train_loader = DataLoader(
+            train_ds, 
+            batch_size=args.batch_size, 
+            sampler=sampler,
+            num_workers=4 # Add workers for efficiency
+        )
+        num_curriculum_samples = len(valid_indices)
+        total_samples = len(train_ds)
+        print(f"  [Curriculum Info] Epoch {epoch}: Using {num_curriculum_samples}/{total_samples} samples.")
+        if num_curriculum_samples == 0:
+             print("  [Curriculum Warning] No samples selected by curriculum! Check difficulty scores.")
+        # --- END NEW ---
+
+        train_loss, train_val_loss, train_acc = train_epoch(
+            model, train_loader, optimizer, criterion, device, epoch,
+            args.grad_accum_steps,
+            value_loss_weight=args.value_loss_weight, # Pass weight
         )
         
-        val_metrics = evaluate(model, val_loader, criterion_rank, device, 'val')
+        val_metrics = evaluate(model, val_loader, criterion, device, 'val')
         
         print(f"[Epoch {epoch:3d}] "
               f"LR: {current_lr:.6f} | "
-              f"Rank L: {metrics['rank_loss']:.4f} | "
-              f"Con L: {metrics['contrast_loss']:.4f} | "
+              f"Rank L: {train_loss:.4f} | "
+              f"Val L: {train_val_loss:.4f} | "
+              f"Train Acc: {train_acc:.4f} | "
               f"Val Hit@1: {val_metrics['val_hit1']:.4f}")
         
+        # FIXED: Step scheduler ONCE per epoch based on validation metric
         if epoch > warmup_epochs:
             scheduler.step(val_metrics['val_hit1'])
         
+        # Save best
         if val_metrics['val_hit1'] > best_val_hit1:
             best_val_hit1 = val_metrics['val_hit1']
             best_val_mrr = val_metrics['val_mrr']
@@ -577,37 +608,39 @@ def main():
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
                 'val_hit1': best_val_hit1,
+                'val_mrr': best_val_mrr,
             }, f"{args.exp_dir}/best.pt")
             print(f"  → New best Hit@1: {best_val_hit1:.4f}, MRR: {best_val_mrr:.4f}")
         else:
             patience_counter += 1
+            
             if patience_counter >= 25:
                 print("Early stopping")
                 break
     
-    if best_val_hit1 == 0:
-        print("Model did not train. No best.pt saved. Exiting.")
-        return
-
+    # Test
     checkpoint = torch.load(f"{args.exp_dir}/best.pt")
     model.load_state_dict(checkpoint['model_state_dict'])
-    test_metrics = evaluate(model, test_loader, criterion_rank, device, 'test')
+    test_metrics = evaluate(model, test_loader, criterion, device, 'test')
     
     print("\n" + "="*70)
     print("FINAL TEST RESULTS")
     print("="*70)
     print(f"Hit@1:  {test_metrics['test_hit1']:.4f} ({test_metrics['test_hit1']*100:.1f}%)")
     print(f"Hit@3:  {test_metrics['test_hit3']:.4f} ({test_metrics['test_hit3']*100:.1f}%)")
+    print(f"Hit@5:  {test_metrics['test_hit5']:.4f} ({test_metrics['test_hit5']*100:.1f}%)")
     print(f"Hit@10: {test_metrics['test_hit10']:.4f} ({test_metrics['test_hit10']*100:.1f}%)")
     print(f"MRR:    {test_metrics['test_mrr']:.4f}")
-    print(f"Tactic Acc: {test_metrics['test_tactic_acc']:.4f}")
     print("="*70)
     
+    # Save results
     results = {
         'test_metrics': test_metrics,
         'best_val_hit1': best_val_hit1,
-        'config': {k: v for k, v in vars(args).items() if k != 'config'}
+        'best_val_mrr': best_val_mrr,
+        'config': vars(args)
     }
     
     with open(f"{args.exp_dir}/results.json", 'w') as f:
@@ -615,5 +648,8 @@ def main():
     
     print(f"\nResults saved to: {args.exp_dir}/results.json")
 
+
 if __name__ == '__main__':
     main()
+
+

@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-# SOTA Horn Clause GNN - Full Research Pipeline (SOTA Fix v1.0)
+# SOTA Horn Clause GNN - Full Research Pipeline (v5 - Final Fix)
 #
-# This script runs the complete pipeline using the SOTA-fixed components:
+# This script is now robust to stale caches and k-dimension mismatches.
 #
-# 1. Model: FixedTemporalSpectralGNN (Spectral, Structural, Temporal pathways)
-# 2. Loss:  Triplet Ranking + SOTA Value + Contrastive Loss
-# 3. Data:  StepPredictionDataset (with contrastive sampling)
-# 4. Cache: Clears stale spectral cache to prevent K-mismatch errors.
+# 1. Clears the stale spectral cache to force regeneration.
+# 2. Disables 'adaptive-k' during preprocessing to ensure a consistent k=16.
+# 3. Passes '--k-dim 16' to train.py, which now forces the model AND
+#    the dataset loaders to use this exact k-value, overriding auto-detection.
 #
 # ==============================================================================
 
@@ -38,11 +38,9 @@ EPOCHS=30
 BATCH_SIZE=16
 HIDDEN_DIM=128
 NUM_LAYERS=3
-LEARNING_RATE=0.0005
+LEARNING_RATE=0.0001
 VALUE_LOSS_WEIGHT=0.1
-CONTRAST_LOSS_WEIGHT=0.3   # <-- NEW: Replaces tactic loss
-LOSS_TYPE="triplet_hard"   # <-- NEW: Specify SOTA loss
-MARGIN=1.0                 # <-- NEW: For triplet loss
+TACTIC_LOSS_WEIGHT=0.2
 
 # --- Script Logic ---
 
@@ -72,7 +70,7 @@ echo "🧬 [Step 1/6] Generating dataset..."
 echo "✅ Dataset generated in $DATA_DIR."
 echo "-------------------------------------------------"
 
-# 2. Clear Stale Cache (Robustness Fix)
+# 2. Clear Stale Cache (NEW FIX)
 echo "🔥 [Step 2/6] Clearing stale spectral cache..."
 rm -rf "$SPECTRAL_DIR"
 mkdir -p "$SPECTRAL_DIR"
@@ -81,6 +79,7 @@ echo "-------------------------------------------------"
 
 # 3. Spectral Feature Preprocessing
 echo "📊 [Step 3/6] Preprocessing spectral features (parallelized)..."
+# This will now use the *correct* node count (len(nodes))
 # We REMOVE --adaptive-k to force a consistent k=16
 "$VENV_PYTHON" batch_process_spectral.py \
     --data_dir "$DATA_DIR" \
@@ -91,11 +90,11 @@ echo "📊 [Step 3/6] Preprocessing spectral features (parallelized)..."
 echo "✅ Spectral features regenerated in $SPECTRAL_DIR with k=$SPECTRAL_K."
 echo "-------------------------------------------------"
 
-# 4. Model Training (MODIFIED FOR SOTA)
+# 4. Model Training
 echo "🧠 [Step 4/6] Starting model training..."
-echo "   - Model: FixedTemporalSpectralGNN (SOTA 3-Pathway)"
-echo "   - Dataset: StepPredictionDataset (w/ Contrastive Sampling)"
-echo "   - Loss: $LOSS_TYPE + SOTA Value Loss + Contrastive Loss"
+echo "   - Model: TacticGuidedGNN (via get_model)"
+echo "   - Dataset: StepPredictionDataset"
+echo "   - Loss: ProofSearchRankingLoss (Fixed) + Value + Tactic"
 "$VENV_PYTHON" train.py \
     --data-dir "$DATA_DIR" \
     --spectral-dir "$SPECTRAL_DIR" \
@@ -103,29 +102,26 @@ echo "   - Loss: $LOSS_TYPE + SOTA Value Loss + Contrastive Loss"
     --epochs $EPOCHS \
     --batch-size $BATCH_SIZE \
     --hidden-dim $HIDDEN_DIM \
-    --num-layers $NUM_LAYERS \
     --lr $LEARNING_RATE \
     --value-loss-weight $VALUE_LOSS_WEIGHT \
-    --contrast-loss-weight $CONTRAST_LOSS_WEIGHT \
-    --loss-type $LOSS_TYPE \
-    --margin $MARGIN \
-    --k-dim $SPECTRAL_K
+    --tactic-loss-weight $TACTIC_LOSS_WEIGHT \
+    --k-dim $SPECTRAL_K \
+    --num-layers $NUM_LAYERS # <-- ADD THIS LINE with your desired value
 echo "✅ Training complete. Results in $EXP_DIR."
 echo "================================================="
-
-# 5. Post-Training Validation (Placeholder)
+# 5. Post-Training Validation
 echo "🔬 [Step 5/6] Generating post-training validation reports..."
-# "$VENV_PYTHON" validate_spectral.py \
-#     --cache-dir "$SPECTRAL_DIR" \
-#     --output-dir "$VALIDATION_DIR/spectral_report"
-# "$VENV_PYTHON" validate_temporal.py \
-#     --output-dir "$VALIDATION_DIR/temporal_report"
-echo "✅ Validation reports placeholder complete."
+"$VENV_PYTHON" validate_spectral.py \
+    --cache-dir "$SPECTRAL_DIR" \
+    --output-dir "$VALIDATION_DIR/spectral_report"
+"$VENV_PYTHON" validate_temporal.py \
+    --output-dir "$VALIDATION_DIR/temporal_report"
+echo "✅ Validation reports saved to $VALIDATION_DIR."
 echo "-------------------------------------------------"
 
 # 6. Inference (Placeholder)
 echo "🔍 [Step 6/6] Inference (Beam Search)..."
-echo "   - The next step is to use search_agent.py with the trained model."
+echo "   - The next step is to use the trained model for proof search."
 # "$VENV_PYTHON" run_search.py \
 #     --model-path "$EXP_DIR/best.pt" \
 #     --data-dir "$DATA_DIR" \ 
@@ -134,7 +130,7 @@ echo "   - The next step is to use search_agent.py with the trained model."
 echo "✅ Inference placeholder complete."
 echo "-------------------------------------------------"
 
-echo "🎉 Full SOTA Pipeline Finished Successfully!"
+echo "🎉 Full Pipeline Finished Successfully!"
 date
 echo "================================================="
 
